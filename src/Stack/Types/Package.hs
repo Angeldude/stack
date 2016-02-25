@@ -30,6 +30,7 @@ import           Data.Text.Encoding (encodeUtf8, decodeUtf8)
 import           Distribution.InstalledPackageInfo (PError)
 import           Distribution.ModuleName (ModuleName)
 import           Distribution.Package hiding (Package,PackageName,packageName,packageVersion,PackageIdentifier)
+import           Distribution.PackageDescription (TestSuiteInterface)
 import           Distribution.System (Platform (..))
 import           Distribution.Text (display)
 import           GHC.Generics
@@ -87,7 +88,7 @@ data Package =
           ,packageAllDeps :: !(Set PackageName)           -- ^ Original dependencies (not sieved).
           ,packageFlags :: !(Map FlagName Bool)           -- ^ Flags used on package.
           ,packageHasLibrary :: !Bool                     -- ^ does the package have a buildable library stanza?
-          ,packageTests :: !(Set Text)                    -- ^ names of test suites
+          ,packageTests :: !(Map Text TestSuiteInterface) -- ^ names and interfaces of test suites
           ,packageBenchmarks :: !(Set Text)               -- ^ names of benchmarks
           ,packageExes :: !(Set Text)                     -- ^ names of executables
           ,packageOpts :: !GetPackageOpts                 -- ^ Args to pass to GHC.
@@ -97,12 +98,17 @@ data Package =
           }
  deriving (Show,Typeable)
 
+packageIdentifier :: Package -> PackageIdentifier
+packageIdentifier pkg =
+    PackageIdentifier (packageName pkg) (packageVersion pkg)
+
 -- | Files that the package depends on, relative to package directory.
 -- Argument is the location of the .cabal file
 newtype GetPackageOpts = GetPackageOpts
     { getPackageOpts :: forall env m. (MonadIO m,HasEnvConfig env, HasPlatform env, MonadThrow m, MonadReader env m, MonadLogger m, MonadCatch m)
                      => SourceMap
                      -> InstalledMap
+                     -> [PackageName]
                      -> [PackageName]
                      -> Path Abs File
                      -> m (Map NamedComponent (Set ModuleName)
@@ -112,13 +118,15 @@ newtype GetPackageOpts = GetPackageOpts
 instance Show GetPackageOpts where
     show _ = "<GetPackageOpts>"
 
+-- | GHC options based on cabal information and ghc-options.
 data BuildInfoOpts = BuildInfoOpts
-    { bioGhcOpts :: [String]
-    -- ^ Options from the ghc-options cabal field
-    , bioGeneratedOpts :: [String]
-    -- ^ Other options from cabal information.  These options can safely have
-    -- 'nubOrd' applied to them, as there are no multi-word options (see
+    { bioOpts :: [String]
+    , bioOneWordOpts :: [String]
+    , bioPackageFlags :: [String]
+    -- ^ These options can safely have 'nubOrd' applied to them, as
+    -- there are no multi-word options (see
     -- https://github.com/commercialhaskell/stack/issues/1255)
+    , bioCabalMacros :: Maybe (Path Abs File)
     } deriving Show
 
 -- | Files to get for a cabal package.
@@ -143,6 +151,8 @@ instance Show GetPackageFiles where
 data PackageWarning
     = UnlistedModulesWarning (Path Abs File) (Maybe String) [ModuleName]
       -- ^ Modules found that are not listed in cabal file
+    | MissingModulesWarning (Path Abs File) (Maybe String) [ModuleName]
+      -- ^ Modules not found in file system, which are listed in cabal file
 instance Show PackageWarning where
     show (UnlistedModulesWarning cabalfp component [unlistedModule]) =
         concat
@@ -162,6 +172,25 @@ instance Show PackageWarning where
                    Just c -> " for '" ++ c ++ "'"
             , " component (add to other-modules):\n    "
             , intercalate "\n    " (map display unlistedModules)]
+    show (MissingModulesWarning cabalfp component [missingModule]) =
+        concat
+            [ "module listed in "
+            , toFilePath (filename cabalfp)
+            , case component of
+                   Nothing -> " for library"
+                   Just c -> " for '" ++ c ++ "'"
+            , " component not found in filesystem: "
+            , display missingModule]
+    show (MissingModulesWarning cabalfp component missingModules) =
+        concat
+            [ "modules listed in "
+            , toFilePath (filename cabalfp)
+            , case component of
+                   Nothing -> " for library"
+                   Just c -> " for '" ++ c ++ "'"
+            , " component not found in filesystem:\n    "
+            , intercalate "\n    " (map display missingModules)]
+
 
 -- | Package build configuration
 data PackageConfig =
@@ -228,6 +257,7 @@ data LocalPackage = LocalPackage
     -- ^ Directory of the package.
     , lpCabalFile     :: !(Path Abs File)
     -- ^ The .cabal file
+    , lpForceDirty    :: !Bool
     , lpDirtyFiles    :: !(Maybe (Set FilePath))
     -- ^ Nothing == not dirty, Just == dirty. Note that the Set may be empty if
     -- we forced the build to treat packages as dirty. Also, the Set may not

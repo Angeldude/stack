@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -28,23 +29,31 @@ module Stack.Config
   ,resolvePackageEntry
   ,getImplicitGlobalProjectDir
   ,getIsGMP4
+  ,getSnapshots
+  ,makeConcreteResolver
+  ,checkOwnership
+  ,getInContainer
   ) where
 
 import qualified Codec.Archive.Tar as Tar
+import qualified Codec.Archive.Zip as Zip
 import qualified Codec.Compression.GZip as GZip
 import           Control.Applicative
 import           Control.Arrow ((***))
-import           Control.Monad
+import           Control.Exception (assert)
+import           Control.Monad (liftM, unless, when, filterM)
 import           Control.Monad.Catch (MonadThrow, MonadCatch, catchAll, throwM)
+import           Control.Monad.Extra (firstJustM)
 import           Control.Monad.IO.Class
 import           Control.Monad.Logger hiding (Loc)
-import           Control.Monad.Reader (MonadReader, ask, runReaderT)
+import           Control.Monad.Reader (MonadReader, ask, asks, runReaderT)
 import           Control.Monad.Trans.Control (MonadBaseControl)
 import qualified Crypto.Hash.SHA256 as SHA256
 import           Data.Aeson.Extended
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Lazy as L
+import           Data.Foldable (forM_)
 import qualified Data.IntMap as IntMap
 import qualified Data.Map as Map
 import           Data.Maybe
@@ -58,25 +67,109 @@ import qualified Distribution.Text
 import           Distribution.Version (simplifyVersionRange)
 import           GHC.Conc (getNumProcessors)
 import           Network.HTTP.Client.Conduit (HasHttpManager, getHttpManager, Manager, parseUrl)
-import           Network.HTTP.Download (download)
+import           Network.HTTP.Download (download, downloadJSON)
 import           Options.Applicative (Parser, strOption, long, help)
 import           Path
 import           Path.Extra (toFilePathNoTrailingSep)
+import           Path.Find (findInParents)
 import           Path.IO
 import qualified Paths_stack as Meta
 import           Safe (headMay)
 import           Stack.BuildPlan
+import           Stack.Config.Build
 import           Stack.Config.Docker
+import           Stack.Config.Nix
 import           Stack.Constants
 import qualified Stack.Image as Image
-import           Stack.Init
 import           Stack.PackageIndex
 import           Stack.Types
 import           Stack.Types.Internal
-import           System.Directory (getAppUserDataDirectory, createDirectoryIfMissing, canonicalizePath)
 import           System.Environment
 import           System.IO
+import           System.PosixCompat.Files (fileOwner, getFileStatus)
+import           System.PosixCompat.User (getEffectiveUserID)
 import           System.Process.Read
+
+-- | If deprecated path exists, use it and print a warning.
+-- Otherwise, return the new path.
+tryDeprecatedPath
+    :: (MonadIO m, MonadLogger m)
+    => Maybe T.Text -- ^ Description of file for warning (if Nothing, no deprecation warning is displayed)
+    -> (Path Abs a -> m Bool) -- ^ Test for existence
+    -> Path Abs a -- ^ New path
+    -> Path Abs a -- ^ Deprecated path
+    -> m (Path Abs a, Bool) -- ^ (Path to use, whether it already exists)
+tryDeprecatedPath mWarningDesc exists new old = do
+    newExists <- exists new
+    if newExists
+        then return (new, True)
+        else do
+            oldExists <- exists old
+            if oldExists
+                then do
+                    case mWarningDesc of
+                        Nothing -> return ()
+                        Just desc ->
+                            $logWarn $ T.concat
+                                [ "Warning: Location of ", desc, " at '"
+                                , T.pack (toFilePath old)
+                                , "' is deprecated; rename it to '"
+                                , T.pack (toFilePath new)
+                                , "' instead" ]
+                    return (old, True)
+                else return (new, False)
+
+-- | Get the location of the implicit global project directory.
+-- If the directory already exists at the deprecated location, its location is returned.
+-- Otherwise, the new location is returned.
+getImplicitGlobalProjectDir
+    :: (MonadIO m, MonadLogger m)
+    => Config -> m (Path Abs Dir)
+getImplicitGlobalProjectDir config =
+    --TEST no warning printed
+    liftM fst $ tryDeprecatedPath
+        Nothing
+        doesDirExist
+        (implicitGlobalProjectDir stackRoot)
+        (implicitGlobalProjectDirDeprecated stackRoot)
+  where
+    stackRoot = configStackRoot config
+
+-- | Download the 'Snapshots' value from stackage.org.
+getSnapshots :: (MonadThrow m, MonadIO m, MonadReader env m, HasHttpManager env, HasStackRoot env, HasConfig env)
+             => m Snapshots
+getSnapshots = askLatestSnapshotUrl >>= parseUrl . T.unpack >>= downloadJSON
+
+-- | Turn an 'AbstractResolver' into a 'Resolver'.
+makeConcreteResolver :: (MonadIO m, MonadReader env m, HasConfig env, MonadThrow m, HasHttpManager env, MonadLogger m)
+                     => AbstractResolver
+                     -> m Resolver
+makeConcreteResolver (ARResolver r) = return r
+makeConcreteResolver ar = do
+    snapshots <- getSnapshots
+    r <-
+        case ar of
+            ARResolver r -> assert False $ return r
+            ARGlobal -> do
+                config <- asks getConfig
+                implicitGlobalDir <- getImplicitGlobalProjectDir config
+                let fp = implicitGlobalDir </> stackDotYaml
+                (ProjectAndConfigMonoid project _, _warnings) <-
+                    liftIO (Yaml.decodeFileEither $ toFilePath fp)
+                    >>= either throwM return
+                return $ projectResolver project
+            ARLatestNightly -> return $ ResolverSnapshot $ Nightly $ snapshotsNightly snapshots
+            ARLatestLTSMajor x ->
+                case IntMap.lookup x $ snapshotsLts snapshots of
+                    Nothing -> error $ "No LTS release found with major version " ++ show x
+                    Just y -> return $ ResolverSnapshot $ LTS x y
+            ARLatestLTS
+                | IntMap.null $ snapshotsLts snapshots -> error "No LTS releases found"
+                | otherwise ->
+                    let (x, y) = IntMap.findMax $ snapshotsLts snapshots
+                     in return $ ResolverSnapshot $ LTS x y
+    $logInfo $ "Selected resolver: " <> resolverName r
+    return r
 
 -- | Get the latest snapshot resolver available.
 getLatestResolver
@@ -95,10 +188,12 @@ configFromConfigMonoid
     :: (MonadLogger m, MonadIO m, MonadCatch m, MonadReader env m, HasHttpManager env)
     => Path Abs Dir -- ^ stack root, e.g. ~/.stack
     -> Path Abs File -- ^ user config file path, e.g. ~/.stack/config.yaml
+    -> Maybe AbstractResolver
     -> Maybe (Project, Path Abs File)
     -> ConfigMonoid
     -> m Config
-configFromConfigMonoid configStackRoot configUserConfigPath mproject configMonoid@ConfigMonoid{..} = do
+configFromConfigMonoid configStackRoot configUserConfigPath mresolver mproject configMonoid@ConfigMonoid{..} = do
+     configWorkDir <- parseRelDir (fromMaybe ".stack-work" configMonoidWorkDir)
      let configConnectionCount = fromMaybe 8 configMonoidConnectionCount
          configHideTHLoading = fromMaybe True configMonoidHideTHLoading
          configLatestSnapshotUrl = fromMaybe
@@ -143,16 +238,21 @@ configFromConfigMonoid configStackRoot configUserConfigPath mproject configMonoi
 
          configCompilerCheck = fromMaybe MatchMinor configMonoidCompilerCheck
 
-     configDocker <- dockerOptsFromMonoid (fmap fst mproject) configStackRoot configMonoidDockerOpts
+     configPlatformVariant <- liftIO $
+         maybe PlatformVariantNone PlatformVariant <$> lookupEnv platformVariantEnvVar
+
+     let configBuild = buildOptsFromMonoid configMonoidBuildOpts
+     configDocker <-
+         dockerOptsFromMonoid (fmap fst mproject) configStackRoot mresolver configMonoidDockerOpts
+     configNix <- nixOptsFromMonoid (fmap fst mproject) configMonoidNixOpts os
 
      rawEnv <- liftIO getEnvironment
-     origEnv <- mkEnvOverride configPlatform
-              $ augmentPathMap (map toFilePath configMonoidExtraPath)
-              $ Map.fromList
-              $ map (T.pack *** T.pack) rawEnv
+     pathsEnv <- augmentPathMap (map toFilePath configMonoidExtraPath)
+                                (Map.fromList (map (T.pack *** T.pack) rawEnv))
+     origEnv <- mkEnvOverride configPlatform pathsEnv
      let configEnvOverride _ = return origEnv
 
-     platformOnlyDir <- runReaderT platformOnlyRelDir configPlatform
+     platformOnlyDir <- runReaderT platformOnlyRelDir (configPlatform,configPlatformVariant)
      configLocalProgramsBase <-
          case configPlatform of
              Platform _ Windows -> do
@@ -166,12 +266,12 @@ configFromConfigMonoid configStackRoot configUserConfigPath mproject configMonoi
      configLocalBin <-
          case configMonoidLocalBinPath of
              Nothing -> do
-                 localDir <- liftIO (getAppUserDataDirectory "local") >>= parseAbsDir
+                 localDir <- getAppUserDataDir "local"
                  return $ localDir </> $(mkRelDir "bin")
              Just userPath ->
                  (case mproject of
                      -- Not in a project
-                     Nothing -> parseRelAsAbsDir userPath
+                     Nothing -> resolveDir' userPath
                      -- Resolves to the project dir and appends the user path if it is relative
                      Just (_, configYaml) -> resolveDir (parent configYaml) userPath)
                  -- TODO: Either catch specific exceptions or add a
@@ -196,6 +296,12 @@ configFromConfigMonoid configStackRoot configUserConfigPath mproject configMonoi
          configRebuildGhcOptions = fromMaybe False configMonoidRebuildGhcOptions
          configApplyGhcOptions = fromMaybe AGOLocals configMonoidApplyGhcOptions
          configAllowNewer = fromMaybe False configMonoidAllowNewer
+         configDefaultTemplate = configMonoidDefaultTemplate
+
+     configAllowDifferentUser <-
+        case configMonoidAllowDifferentUser of
+            Just True -> return True
+            _ -> getInContainer
 
      return Config {..}
 
@@ -269,9 +375,11 @@ loadConfig :: (MonadLogger m,MonadIO m,MonadCatch m,MonadThrow m,MonadBaseContro
            -- ^ Config monoid from parsed command-line arguments
            -> Maybe (Path Abs File)
            -- ^ Override stack.yaml
+           -> Maybe AbstractResolver
+           -- ^ Override resolver
            -> m (LoadConfig m)
-loadConfig configArgs mstackYaml = do
-    stackRoot <- determineStackRoot
+loadConfig configArgs mstackYaml mresolver = do
+    (stackRoot, userOwnsStackRoot) <- determineStackRootAndOwnership
     userConfigPath <- getDefaultUserConfigPath stackRoot
     extraConfigs0 <- getExtraConfigs userConfigPath >>= mapM loadYaml
     let extraConfigs =
@@ -281,17 +389,30 @@ loadConfig configArgs mstackYaml = do
                               (configMonoidDockerOpts c) {dockerMonoidDefaultEnable = False}})
                 extraConfigs0
     mproject <- loadProjectConfig mstackYaml
+
+    let printUserMessage (p, _, _) =
+         maybe (return ()) ($logWarn . T.pack) (projectUserMsg p)
+    maybe (return ()) printUserMessage mproject
+
     let mproject' = (\(project, stackYaml, _) -> (project, stackYaml)) <$> mproject
-    config <- configFromConfigMonoid stackRoot userConfigPath mproject' $ mconcat $
+    config <- configFromConfigMonoid stackRoot userConfigPath mresolver mproject' $ mconcat $
         case mproject of
             Nothing -> configArgs : extraConfigs
             Just (_, _, projectConfig) -> configArgs : projectConfig : extraConfigs
     unless (fromCabalVersion Meta.version `withinRange` configRequireStackVersion config)
         (throwM (BadStackVersionException (configRequireStackVersion config)))
+
+    let mprojectRoot = fmap (\(_, fp, _) -> parent fp) mproject
+    unless (configAllowDifferentUser config) $ do
+        unless userOwnsStackRoot $
+            throwM (UserDoesn'tOwnDirectory stackRoot)
+        forM_ mprojectRoot $ \dir ->
+            checkOwnership (dir </> configWorkDir config)
+
     return LoadConfig
         { lcConfig          = config
-        , lcLoadBuildConfig = loadBuildConfig mproject config
-        , lcProjectRoot     = fmap (\(_, fp, _) -> parent fp) mproject
+        , lcLoadBuildConfig = loadBuildConfig mproject config mresolver
+        , lcProjectRoot     = mprojectRoot
         }
 
 -- | Load the build configuration, adds build-specific values to config loaded by @loadConfig@.
@@ -315,8 +436,8 @@ loadBuildConfig mproject config mresolver mcompiler = do
                 dest = destDir </> stackDotYaml
                 dest' :: FilePath
                 dest' = toFilePath dest
-            createTree destDir
-            exists <- fileExists dest
+            ensureDir destDir
+            exists <- doesFileExist dest
             if exists
                then do
                    ProjectAndConfigMonoid project _ <- loadYaml dest
@@ -342,7 +463,8 @@ loadBuildConfig mproject config mresolver mcompiler = do
                    $logInfo ("Writing implicit global project config file to: " <> T.pack dest')
                    $logInfo "Note: You can change the snapshot via the resolver field there."
                    let p = Project
-                           { projectPackages = mempty
+                           { projectUserMsg = Nothing
+                           , projectPackages = mempty
                            , projectExtraDeps = mempty
                            , projectFlags = mempty
                            , projectResolver = r
@@ -357,7 +479,7 @@ loadBuildConfig mproject config mresolver mcompiler = do
                            , "# '", encodeUtf8 (T.pack $ toFilePath $ configUserConfigPath config), "' instead.\n"
                            , "#\n"
                            , "# For more information about stack's configuration, see\n"
-                           , "# https://github.com/commercialhaskell/stack/blob/release/doc/yaml_configuration.md\n"
+                           , "# http://docs.haskellstack.org/en/stable/yaml_configuration/\n"
                            , "#\n"
                            , Yaml.encode p]
                        S.writeFile (toFilePath $ parent dest </> $(mkRelFile "README.txt")) $ S.concat
@@ -386,7 +508,7 @@ loadBuildConfig mproject config mresolver mcompiler = do
                     return $ mbpCompilerVersion mbp
                 ResolverCompiler wantedCompiler -> return wantedCompiler
 
-    extraPackageDBs <- mapM parseRelAsAbsDir (projectExtraPackageDBs project)
+    extraPackageDBs <- mapM resolveDir' (projectExtraPackageDBs project)
 
     packageCaches <- runReaderT (getMinimalEnvOverride >>= getPackageCaches) miniConfig
 
@@ -408,103 +530,183 @@ loadBuildConfig mproject config mresolver mcompiler = do
 -- necessary.
 resolvePackageEntry
     :: (MonadIO m, MonadThrow m, MonadReader env m, HasHttpManager env, MonadLogger m, MonadCatch m
-       ,MonadBaseControl IO m)
+       ,MonadBaseControl IO m, HasConfig env)
     => EnvOverride
     -> Path Abs Dir -- ^ project root
     -> PackageEntry
-    -> m [(Path Abs Dir, Bool)]
+    -> m [(Path Abs Dir, TreatLikeExtraDep)]
 resolvePackageEntry menv projRoot pe = do
     entryRoot <- resolvePackageLocation menv projRoot (peLocation pe)
     paths <-
         case peSubdirs pe of
             [] -> return [entryRoot]
             subs -> mapM (resolveDir entryRoot) subs
-    case peValidWanted pe of
-        Nothing -> return ()
-        Just _ -> $logWarn "Warning: you are using the deprecated valid-wanted field. You should instead use extra-dep. See: https://github.com/commercialhaskell/stack/blob/release/doc/yaml_configuration.md#packages"
-    return $ map (, not $ peExtraDep pe) paths
+    return $ map (, peExtraDep pe) paths
 
 -- | Resolve a PackageLocation into a path, downloading and cloning as
 -- necessary.
 resolvePackageLocation
     :: (MonadIO m, MonadThrow m, MonadReader env m, HasHttpManager env, MonadLogger m, MonadCatch m
-       ,MonadBaseControl IO m)
+       ,MonadBaseControl IO m, HasConfig env)
     => EnvOverride
     -> Path Abs Dir -- ^ project root
     -> PackageLocation
     -> m (Path Abs Dir)
 resolvePackageLocation _ projRoot (PLFilePath fp) = resolveDir projRoot fp
-resolvePackageLocation _ projRoot (PLHttpTarball url) = do
-    let name = T.unpack $ decodeUtf8 $ B16.encode $ SHA256.hash $ encodeUtf8 url
-        root = projRoot </> workDirRel </> $(mkRelDir "downloaded")
-    fileRel <- parseRelFile $ name ++ ".tar.gz"
+resolvePackageLocation menv projRoot (PLRemote url remotePackageType) = do
+    workDir <- getWorkDir
+    let nameBeforeHashing = case remotePackageType of
+            RPTHttp        -> url
+            RPTGit commit  -> T.unwords [url, commit]
+            RPTHg  commit  -> T.unwords [url, commit, "hg"]
+        name = T.unpack $ decodeUtf8 $ B16.encode $ SHA256.hash $ encodeUtf8 nameBeforeHashing
+        root = projRoot </> workDir </> $(mkRelDir "downloaded")
+        fileExtension = case remotePackageType of
+            RPTHttp -> ".http-archive"
+            _       -> ".unused"
+
+    fileRel <- parseRelFile $ name ++ fileExtension
     dirRel <- parseRelDir name
     dirRelTmp <- parseRelDir $ name ++ ".tmp"
     let file = root </> fileRel
         dir = root </> dirRel
         dirTmp = root </> dirRelTmp
 
-    exists <- dirExists dir
+    exists <- doesDirExist dir
     unless exists $ do
-        req <- parseUrl $ T.unpack url
-        _ <- download req file
+        ignoringAbsence (removeDirRecur dirTmp)
 
-        removeTreeIfExists dirTmp
-        liftIO $ withBinaryFile (toFilePath file) ReadMode $ \h -> do
-            lbs <- L.hGetContents h
-            let entries = Tar.read $ GZip.decompress lbs
-            Tar.unpack (toFilePath dirTmp) entries
-            renameDir dirTmp dir
+        let cloneAndExtract commandName resetCommand commit = do
+                ensureDir (parent dirTmp)
+                readInNull (parent dirTmp) commandName menv
+                    [ "clone"
+                    , T.unpack url
+                    , toFilePathNoTrailingSep dirTmp
+                    ]
+                    Nothing
+                readInNull dirTmp commandName menv
+                    (resetCommand ++ [T.unpack commit])
+                    (Just $ "Please ensure that commit " <> commit <>
+                      " exists within " <> url)
 
-    x <- listDirectory dir
-    case x of
-        ([dir'], []) -> return dir'
-        (dirs, files) -> do
-            removeFileIfExists file
-            removeTreeIfExists dir
-            throwM $ UnexpectedTarballContents dirs files
+        case remotePackageType of
+            RPTHttp -> do
+                let fp = toFilePath file
+                req <- parseUrl $ T.unpack url
+                _ <- download req file
 
-resolvePackageLocation menv projRoot (PLGit url commit) = do
-    let name = T.unpack $ decodeUtf8 $ B16.encode $ SHA256.hash $ encodeUtf8 $ T.unwords [url, commit]
-        root = projRoot </> workDirRel </> $(mkRelDir "downloaded")
-    dirRel <- parseRelDir $ name ++ ".git"
-    dirRelTmp <- parseRelDir $ name ++ ".git.tmp"
-    let dir = root </> dirRel
-        dirTmp = root </> dirRelTmp
+                let tryTar = do
+                        $logDebug $ "Trying to untar " <> T.pack fp
+                        liftIO $ withBinaryFile fp ReadMode $ \h -> do
+                            lbs <- L.hGetContents h
+                            let entries = Tar.read $ GZip.decompress lbs
+                            Tar.unpack fp entries
+                    tryZip = do
+                        $logDebug $ "Trying to unzip " <> T.pack fp
+                        archive <- fmap Zip.toArchive $ liftIO $ L.readFile fp
+                        liftIO $  Zip.extractFilesFromArchive [Zip.OptDestination
+                                                               (toFilePath dirTmp)] archive
+                    err = throwM $ UnableToExtractArchive url file
 
-    exists <- dirExists dir
-    unless exists $ do
-        removeTreeIfExists dirTmp
-        createTree (parent dirTmp)
-        readInNull (parent dirTmp) "git" menv
-            [ "clone"
-            , T.unpack url
-            , toFilePathNoTrailingSep dirTmp
-            ]
-            Nothing
-        readInNull dirTmp "git" menv
-            [ "reset"
-            , "--hard"
-            , T.unpack commit
-            ]
-            Nothing
+                    catchAllLog goodpath handler =
+                        catchAll goodpath $ \e -> do
+                            $logDebug $ "Got exception: " <> T.pack (show e)
+                            handler
+
+                tryTar `catchAllLog` tryZip `catchAllLog` err
+
+            RPTGit commit -> cloneAndExtract "git" ["reset", "--hard"] commit
+            RPTHg  commit -> cloneAndExtract "hg"  ["update", "-C"]    commit
+
         renameDir dirTmp dir
 
-    return dir
+    case remotePackageType of
+        RPTHttp -> do x <- listDir dir
+                      case x of
+                          ([dir'], []) -> return dir'
+                          (dirs, files) -> do
+                              ignoringAbsence (removeFile file)
+                              ignoringAbsence (removeDirRecur dir)
+                              throwM $ UnexpectedArchiveContents dirs files
+        _ -> return dir
 
--- | Get the stack root, e.g. ~/.stack
-determineStackRoot :: (MonadIO m, MonadThrow m) => m (Path Abs Dir)
-determineStackRoot = do
-    env <- liftIO getEnvironment
-    case lookup stackRootEnvVar env of
-        Nothing -> do
-            x <- liftIO $ getAppUserDataDirectory stackProgName
-            parseAbsDir x
-        Just x -> do
-            y <- liftIO $ do
-                createDirectoryIfMissing True x
-                canonicalizePath x
-            parseAbsDir y
+-- | Get the stack root, e.g. @~/.stack@, and determine whether the user owns it.
+--
+-- On Windows, the second value is always 'True'.
+determineStackRootAndOwnership
+    :: (MonadIO m, MonadCatch m)
+    => m (Path Abs Dir, Bool)
+determineStackRootAndOwnership = do
+    stackRoot <- do
+        mstackRoot <- liftIO $ lookupEnv stackRootEnvVar
+        case mstackRoot of
+            Nothing -> getAppUserDataDir stackProgName
+            Just x -> parseAbsDir x
+
+    (existingStackRootOrParentDir, userOwnsIt) <- do
+        mdirAndOwnership <- findInParents getDirAndOwnership stackRoot
+        case mdirAndOwnership of
+            Just x -> return x
+            Nothing -> throwM (BadStackRootEnvVar stackRoot)
+
+    when (existingStackRootOrParentDir /= stackRoot) $
+        if userOwnsIt
+            then liftIO $ ensureDir stackRoot
+            else throwM $
+                Won'tCreateStackRootInDirectoryOwnedByDifferentUser
+                    stackRoot
+                    existingStackRootOrParentDir
+
+    stackRoot' <- canonicalizePath stackRoot
+    return (stackRoot', userOwnsIt)
+
+-- | @'checkOwnership' dir@ throws 'UserDoesn'tOwnDirectory' if @dir@
+-- isn't owned by the current user.
+--
+-- If @dir@ doesn't exist, its parent directory is checked instead.
+-- If the parent directory doesn't exist either, @'NoSuchDirectory' ('parent' dir)@
+-- is thrown.
+checkOwnership :: (MonadIO m, MonadCatch m) => Path Abs Dir -> m ()
+checkOwnership dir = do
+    mdirAndOwnership <- firstJustM getDirAndOwnership [dir, parent dir]
+    case mdirAndOwnership of
+        Just (_, True) -> return ()
+        Just (dir', False) -> throwM (UserDoesn'tOwnDirectory dir')
+        Nothing ->
+            (throwM . NoSuchDirectory) $ (toFilePathNoTrailingSep . parent) dir
+
+-- | @'getDirAndOwnership' dir@ returns @'Just' (dir, 'True')@ when @dir@
+-- exists and the current user owns it in the sense of 'isOwnedByUser'.
+getDirAndOwnership
+    :: (MonadIO m, MonadCatch m)
+    => Path Abs Dir
+    -> m (Maybe (Path Abs Dir, Bool))
+getDirAndOwnership dir = forgivingAbsence $ do
+    ownership <- isOwnedByUser dir
+    return (dir, ownership)
+
+-- | Check whether the current user (determined with 'getEffectiveUserId') is
+-- the owner for the given path.
+--
+-- Will always return 'True' on Windows.
+isOwnedByUser :: MonadIO m => Path Abs t -> m Bool
+isOwnedByUser path = liftIO $ do
+    if osIsWindows
+        then return True
+        else do
+            fileStatus <- getFileStatus (toFilePath path)
+            user <- getEffectiveUserID
+            return (user == fileOwner fileStatus)
+  where
+#ifdef WINDOWS
+    osIsWindows = True
+#else
+    osIsWindows = False
+#endif
+
+-- | 'True' if we are currently running inside a Docker container.
+getInContainer :: (MonadIO m) => m Bool
+getInContainer = liftIO (isJust <$> lookupEnv inContainerEnvVar)
 
 -- | Determine the extra config file locations which exist.
 --
@@ -522,7 +724,7 @@ getExtraConfigs userConfigPath = do
     mstackGlobalConfig <-
         maybe (return Nothing) (fmap Just . parseAbsFile)
       $ lookup "STACK_GLOBAL_CONFIG" env
-    filterM fileExists
+    filterM doesFileExist
         $ fromMaybe userConfigPath mstackConfig
         : maybe [] return (mstackGlobalConfig <|> defaultStackGlobalConfigPath)
 
@@ -547,28 +749,19 @@ getProjectConfig Nothing = do
     case lookup "STACK_YAML" env of
         Just fp -> do
             $logInfo "Getting project config file from STACK_YAML environment"
-            liftM Just $ case parseAbsFile fp of
-                Left _ -> do
-                    currDir <- getWorkingDir
-                    resolveFile currDir fp
-                Right path -> return path
+            liftM Just $ resolveFile' fp
         Nothing -> do
-            currDir <- getWorkingDir
-            search currDir
+            currDir <- getCurrentDir
+            findInParents getStackDotYaml currDir
   where
-    search dir = do
+    getStackDotYaml dir = do
         let fp = dir </> stackDotYaml
             fp' = toFilePath fp
         $logDebug $ "Checking for project config at: " <> T.pack fp'
-        exists <- fileExists fp
+        exists <- doesFileExist fp
         if exists
             then return $ Just fp
-            else do
-                let dir' = parent dir
-                if dir == dir'
-                    -- fully traversed, give up
-                    then return Nothing
-                    else search dir'
+            else return Nothing
 
 -- | Find the project config file location, respecting environment variables
 -- and otherwise traversing parents. If no config is found, we supply a default
@@ -581,7 +774,7 @@ loadProjectConfig mstackYaml = do
     mfp <- getProjectConfig mstackYaml
     case mfp of
         Just fp -> do
-            currDir <- getWorkingDir
+            currDir <- getCurrentDir
             $logDebug $ "Loading project config file " <>
                         T.pack (maybe (toFilePath fp) toFilePath (stripDir currDir fp))
             load fp
@@ -605,7 +798,7 @@ getDefaultGlobalConfigPath =
             liftM (Just . fst ) $
             tryDeprecatedPath
                 (Just "non-project global configuration file")
-                fileExists
+                doesFileExist
                 new
                 old
         (Just new,Nothing) -> return (Just new)
@@ -620,19 +813,18 @@ getDefaultUserConfigPath
 getDefaultUserConfigPath stackRoot = do
     (path, exists) <- tryDeprecatedPath
         (Just "non-project configuration file")
-        fileExists
+        doesFileExist
         (defaultUserConfigPath stackRoot)
         (defaultUserConfigPathDeprecated stackRoot)
     unless exists $ do
-        createTree (parent path)
+        ensureDir (parent path)
         liftIO $ S.writeFile (toFilePath path) $ S.concat
             [ "# This file contains default non-project-specific settings for 'stack', used\n"
             , "# in all projects.  For more information about stack's configuration, see\n"
-            , "# https://github.com/commercialhaskell/stack/blob/release/doc/yaml_configuration.md\n"
+            , "# http://docs.haskellstack.org/en/stable/yaml_configuration/\n"
             , "#\n"
             , Yaml.encode (mempty :: Object) ]
     return path
-
 
 packagesParser :: Parser [String]
 packagesParser = many (strOption (long "package" <> help "Additional packages that must be installed"))

@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE PackageImports        #-}
 {-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE TupleSections         #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
@@ -15,8 +16,8 @@ module Stack.Build.Source
     , loadLocalPackage
     , parseTargetsFromBuildOpts
     , addUnlistedToBuildCache
+    , getPackageConfig
     ) where
-
 
 import           Control.Applicative
 import           Control.Arrow ((&&&))
@@ -27,7 +28,7 @@ import           Control.Monad.IO.Class
 import           Control.Monad.Logger
 import           Control.Monad.Reader (MonadReader, asks)
 import           Control.Monad.Trans.Resource
-import           Crypto.Hash (Digest, SHA256)
+import "cryptohash" Crypto.Hash (Digest, SHA256)
 import           Crypto.Hash.Conduit (sinkHash)
 import qualified Data.ByteString as S
 import           Data.Byteable (toBytes)
@@ -62,23 +63,23 @@ import           Stack.Constants (wiredInPackages)
 import           Stack.Package
 import           Stack.Types
 
-import           System.Directory
+import qualified System.Directory as D
 import           System.IO (withBinaryFile, IOMode (ReadMode))
 import           System.IO.Error (isDoesNotExistError)
 
 loadSourceMap :: (MonadIO m, MonadCatch m, MonadReader env m, HasBuildConfig env, MonadBaseControl IO m, HasHttpManager env, MonadLogger m, HasEnvConfig env)
               => NeedTargets
-              -> BuildOpts
+              -> BuildOptsCLI
               -> m ( Map PackageName SimpleTarget
                    , MiniBuildPlan
                    , [LocalPackage]
                    , Set PackageName -- non-local targets
                    , SourceMap
                    )
-loadSourceMap needTargets bopts = do
+loadSourceMap needTargets boptsCli = do
     bconfig <- asks getBuildConfig
     rawLocals <- getLocalPackageViews
-    (mbp0, cliExtraDeps, targets) <- parseTargetsFromBuildOpts needTargets bopts
+    (mbp0, cliExtraDeps, targets) <- parseTargetsFromBuildOpts needTargets boptsCli
     let latestVersion =
             Map.fromListWith max $
             map toTuple $
@@ -92,8 +93,8 @@ loadSourceMap needTargets bopts = do
         (Map.keysSet $ Map.filter (== STUnknown) targets)
         latestVersion
 
-    locals <- mapM (loadLocalPackage bopts targets) $ Map.toList rawLocals
-    checkFlagsUsed bopts locals extraDeps0 (mbpPackages mbp0)
+    locals <- mapM (loadLocalPackage boptsCli targets) $ Map.toList rawLocals
+    checkFlagsUsed boptsCli locals extraDeps0 (mbpPackages mbp0)
     checkComponentsBuildable locals
 
     let
@@ -121,8 +122,8 @@ loadSourceMap needTargets bopts = do
         -- Overwrite any flag settings with those from the config file
         extraDeps3 = Map.mapWithKey
             (\n (v, f) -> PSUpstream v Local $
-                case ( Map.lookup (Just n) $ boptsFlags bopts
-                     , Map.lookup Nothing $ boptsFlags bopts
+                case ( Map.lookup (Just n) $ boptsCLIFlags boptsCli
+                     , Map.lookup Nothing $ boptsCLIFlags boptsCli
                      , Map.lookup n $ bcFlags bconfig
                      ) of
                     -- Didn't have any flag overrides, fall back to the flags
@@ -144,7 +145,7 @@ loadSourceMap needTargets bopts = do
                  in (packageName p, PSLocal lp)
             , extraDeps3
             , flip fmap (mbpPackages mbp) $ \mpi ->
-                (PSUpstream (mpiVersion mpi) Snap (mpiFlags mpi))
+                PSUpstream (mpiVersion mpi) Snap (mpiFlags mpi)
             ] `Map.difference` Map.fromList (map (, ()) (HashSet.toList wiredInPackages))
 
     return (targets, mbp, locals, nonLocalTargets, sourceMap)
@@ -153,9 +154,9 @@ loadSourceMap needTargets bopts = do
 parseTargetsFromBuildOpts
     :: (MonadIO m, MonadCatch m, MonadReader env m, HasBuildConfig env, MonadBaseControl IO m, HasHttpManager env, MonadLogger m, HasEnvConfig env)
     => NeedTargets
-    -> BuildOpts
+    -> BuildOptsCLI
     -> m (MiniBuildPlan, M.Map PackageName Version, M.Map PackageName SimpleTarget)
-parseTargetsFromBuildOpts needTargets bopts = do
+parseTargetsFromBuildOpts needTargets boptscli = do
     bconfig <- asks getBuildConfig
     mbp0 <-
         case bcResolver bconfig of
@@ -175,14 +176,14 @@ parseTargetsFromBuildOpts needTargets bopts = do
                 stackYamlFP <- asks $ bcStackYaml . getBuildConfig
                 parseCustomMiniBuildPlan stackYamlFP url
     rawLocals <- getLocalPackageViews
-    workingDir <- getWorkingDir
+    workingDir <- getCurrentDir
 
     let snapshot = mpiVersion <$> mbpPackages mbp0
     flagExtraDeps <- convertSnapshotToExtra
         snapshot
         (bcExtraDeps bconfig)
         rawLocals
-        (catMaybes $ Map.keys $ boptsFlags bopts)
+        (catMaybes $ Map.keys $ boptsCLIFlags boptscli)
 
     (cliExtraDeps, targets) <-
         parseTargets
@@ -192,7 +193,7 @@ parseTargetsFromBuildOpts needTargets bopts = do
             (flagExtraDeps <> bcExtraDeps bconfig)
             (fst <$> rawLocals)
             workingDir
-            (boptsTargets bopts)
+            (boptsCLITargets boptscli)
     return (mbp0, cliExtraDeps <> flagExtraDeps, targets)
 
 -- | For every package in the snapshot which is referenced by a flag, give the
@@ -204,8 +205,7 @@ convertSnapshotToExtra
     -> Map PackageName a -- ^ locals
     -> [PackageName] -- ^ packages referenced by a flag
     -> m (Map PackageName Version)
-convertSnapshotToExtra snapshot extra0 locals flags0 =
-    go Map.empty flags0
+convertSnapshotToExtra snapshot extra0 locals = go Map.empty
   where
     go !extra [] = return extra
     go extra (flag:flags)
@@ -226,8 +226,8 @@ getLocalPackageViews :: (MonadThrow m, MonadIO m, MonadReader env m, HasEnvConfi
                      => m (Map PackageName (LocalPackageView, GenericPackageDescription))
 getLocalPackageViews = do
     econfig <- asks getEnvConfig
-    locals <- forM (Map.toList $ envConfigPackages econfig) $ \(dir, validWanted) -> do
-        cabalfp <- getCabalFileName dir
+    locals <- forM (Map.toList $ envConfigPackages econfig) $ \(dir, treatLikeExtraDep) -> do
+        cabalfp <- findOrGenerateCabalFile dir
         (warnings,gpkg) <- readPackageUnresolved cabalfp
         mapM_ (printCabalFileWarning cabalfp) warnings
         let cabalID = package $ packageDescription gpkg
@@ -237,7 +237,7 @@ getLocalPackageViews = do
                 { lpvVersion = fromCabalVersion $ pkgVersion cabalID
                 , lpvRoot = dir
                 , lpvCabalFP = cabalfp
-                , lpvExtraDep = not validWanted
+                , lpvExtraDep = treatLikeExtraDep
                 , lpvComponents = getNamedComponents gpkg
                 }
         return (name, (lpv, gpkg))
@@ -281,22 +281,14 @@ splitComponents =
 loadLocalPackage
     :: forall m env.
        (MonadReader env m, HasEnvConfig env, MonadCatch m, MonadLogger m, MonadIO m)
-    => BuildOpts
+    => BuildOptsCLI
     -> Map PackageName SimpleTarget
     -> (PackageName, (LocalPackageView, GenericPackageDescription))
     -> m LocalPackage
-loadLocalPackage bopts targets (name, (lpv, gpkg)) = do
-    bconfig <- asks getBuildConfig
-    econfig <- asks getEnvConfig
-
-    let config = PackageConfig
-            { packageConfigEnableTests = False
-            , packageConfigEnableBenchmarks = False
-            , packageConfigFlags = localFlags (boptsFlags bopts) bconfig name
-            , packageConfigCompilerVersion = envConfigCompilerVersion econfig
-            , packageConfigPlatform = configPlatform $ getConfig bconfig
-            }
-        pkg = resolvePackage config gpkg
+loadLocalPackage boptsCli targets (name, (lpv, gpkg)) = do
+    config  <- getPackageConfig boptsCli name
+    bopts <- asks (configBuild . getConfig)
+    let pkg = resolvePackage config gpkg
 
         mtarget = Map.lookup name targets
         (exes, tests, benches) =
@@ -305,7 +297,7 @@ loadLocalPackage bopts targets (name, (lpv, gpkg)) = do
                 Just STLocalAll ->
                     ( packageExes pkg
                     , if boptsTests bopts
-                        then packageTests pkg
+                        then Map.keysSet (packageTests pkg)
                         else Set.empty
                     , if boptsBenchmarks bopts
                         then packageBenchmarks pkg
@@ -355,8 +347,9 @@ loadLocalPackage bopts targets (name, (lpv, gpkg)) = do
         , lpBenchDeps = packageDeps benchpkg
         , lpTestBench = btpkg
         , lpFiles = files
+        , lpForceDirty = boptsForceDirty bopts
         , lpDirtyFiles =
-            if not (Set.null dirtyFiles) || boptsForceDirty bopts
+            if not (Set.null dirtyFiles)
                 then let tryStripPrefix y =
                           fromMaybe y (stripPrefix (toFilePath $ lpvRoot lpv) y)
                       in Just $ Set.map tryStripPrefix dirtyFiles
@@ -374,24 +367,24 @@ loadLocalPackage bopts targets (name, (lpv, gpkg)) = do
         -- present, then they must not be buildable.
         , lpUnbuildable = toComponents
             (exes `Set.difference` packageExes pkg)
-            (tests `Set.difference` packageTests pkg)
+            (tests `Set.difference` Map.keysSet (packageTests pkg))
             (benches `Set.difference` packageBenchmarks pkg)
         }
 
 -- | Ensure that the flags specified in the stack.yaml file and on the command
 -- line are used.
 checkFlagsUsed :: (MonadThrow m, MonadReader env m, HasBuildConfig env)
-               => BuildOpts
+               => BuildOptsCLI
                -> [LocalPackage]
                -> Map PackageName extraDeps -- ^ extra deps
                -> Map PackageName snapshot -- ^ snapshot, for error messages
                -> m ()
-checkFlagsUsed bopts lps extraDeps snapshot = do
+checkFlagsUsed boptsCli lps extraDeps snapshot = do
     bconfig <- asks getBuildConfig
 
         -- Check if flags specified in stack.yaml and the command line are
         -- used, see https://github.com/commercialhaskell/stack/issues/617
-    let flags = map (, FSCommandLine) [(k, v) | (Just k, v) <- Map.toList $ boptsFlags bopts]
+    let flags = map (, FSCommandLine) [(k, v) | (Just k, v) <- Map.toList $ boptsCLIFlags boptsCli]
              ++ map (, FSStackYaml) (Map.toList $ bcFlags bconfig)
 
         localNameMap = Map.fromList $ map (packageName . lpPackage &&& lpPackage) lps
@@ -424,7 +417,7 @@ checkFlagsUsed bopts lps extraDeps snapshot = do
         $ Set.fromList unusedFlags
 
 -- | All flags for a local package
-localFlags :: (Map (Maybe PackageName) (Map FlagName Bool))
+localFlags :: Map (Maybe PackageName) (Map FlagName Bool)
            -> BuildConfig
            -> PackageName
            -> Map FlagName Bool
@@ -540,7 +533,7 @@ getModTimeMaybe fp =
         (catch
              (liftM
                   (Just . modTime)
-                  (getModificationTime fp))
+                  (D.getModificationTime fp))
              (\e ->
                    if isDoesNotExistError e
                        then return Nothing
@@ -571,3 +564,19 @@ checkComponentsBuildable lps =
         | lp <- lps
         , c <- Set.toList (lpUnbuildable lp)
         ]
+
+-- | Get 'PackageConfig' for package given its name.
+getPackageConfig :: (MonadIO m, MonadThrow m, MonadCatch m, MonadLogger m, MonadReader env m, HasEnvConfig env)
+  => BuildOptsCLI
+  -> PackageName
+  -> m PackageConfig
+getPackageConfig boptsCli name = do
+  econfig <- asks getEnvConfig
+  bconfig <- asks getBuildConfig
+  return PackageConfig
+    { packageConfigEnableTests = False
+    , packageConfigEnableBenchmarks = False
+    , packageConfigFlags = localFlags (boptsCLIFlags boptsCli) bconfig name
+    , packageConfigCompilerVersion = envConfigCompilerVersion econfig
+    , packageConfigPlatform = configPlatform $ getConfig bconfig
+    }

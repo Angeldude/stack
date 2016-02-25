@@ -1,3 +1,5 @@
+# User guide
+
 stack is a modern, cross-platform build tool for Haskell code.
 
 This guide takes a new stack user through the typical workflows. This guide
@@ -389,7 +391,7 @@ containing the module in question is not available. To tell stack to use text,
 you need to add it to your .cabal file — specifically in your build-depends
 section, like this:
 
-```cabal
+```
 library
   hs-source-dirs:      src
   exposed-modules:     Lib
@@ -458,7 +460,7 @@ While constructing the BuildPlan the following exceptions were encountered:
     Could not find package acme-missiles in known packages
 
 --  Failure when adding dependencies:
-      acme-missiles: needed (-any), latest is 0.3, but not present in build plan
+      acme-missiles: needed (-any), stack configuration has no specified version (latest applicable is 0.3)
     needed for package: helloworld-0.1.0.0
 
 Recommended action: try adding the following to your extra-deps in /home/michael/helloworld/stack.yaml
@@ -628,224 +630,423 @@ using [Yesod](http://www.yesodweb.com/). To get the code, we'll use the `stack
 unpack` command:
 
 ```
-michael@d30748af6d3d:~$ stack unpack yackage-0.8.0
-yackage-0.8.0: download
-Unpacked yackage-0.8.0 to /home/michael/yackage-0.8.0/
-michael@d30748af6d3d:~$ cd yackage-0.8.0/
+cueball:~$ stack unpack yackage-0.8.0
+Unpacked yackage-0.8.0 to /var/home/harendra/yackage-0.8.0/
+cueball:~$ cd yackage-0.8.0/
 ```
 
+### stack init
 This new directory does not have a stack.yaml file, so we need to make one
 first. We could do it by hand, but let's be lazy instead with the `stack init`
 command:
 
 ```
-michael@d30748af6d3d:~/yackage-0.8.0$ stack init
-Writing default config file to: /home/michael/yackage-0.8.0/stack.yaml
-Basing on cabal files:
-- /home/michael/yackage-0.8.0/yackage.cabal
+cueball:~/yackage-0.8.0$ stack init
+Using cabal packages:
+- yackage.cabal
 
-Checking against build plan lts-3.2
-Selected resolver: lts-3.2
-Wrote project config to: /home/michael/yackage-0.8.0/stack.yaml
-michael@d30748af6d3d:~/yackage-0.8.0$ cat stack.yaml
-flags:
-  yackage:
-    upload: true
-packages:
-- '.'
-extra-deps: []
-resolver: lts-3.2
+Selecting the best among 6 snapshots...
+
+* Matches lts-4.1
+
+Selected resolver: lts-4.1
+Initialising configuration using resolver: lts-4.1
+Total number of user packages considered: 1
+Writing configuration to file: stack.yaml
+All done.
 ```
 
 stack init does quite a few things for you behind the scenes:
 
-* Creates a list of snapshots that would be good candidates.
-    * The basic algorithm here is to prefer options in this order:
-        * Snapshots for which you've already built some packages (to
-          increase sharing of binary package databases, as we'll discuss later)
-        * Recent snapshots
-        * LTS
-    * These preferences can be tweaked with command line flags (see `stack init
-      --help`).
 * Finds all of the .cabal files in your current directory and subdirectories
   (unless you use `--ignore-subdirs`) and determines the packages and versions
   they require
-* Finds a combination of snapshot and package flags that allows everything to
-  compile
+* Finds the best combination of snapshot and package flags that allows everything to
+  compile with minimum external dependencies
+* It tries to look for the best matching snapshot from latest LTS, latest
+  nightly, other LTS versions in that order
 
 Assuming it finds a match, it will write your stack.yaml file, and everything
-will work. Given that LTS Haskell and Stackage Nightly have ~1400 of the most
-common Haskell packages, this will often be enough. However, let's simulate a
-failure by adding acme-missiles to our build-depends and re-initing:
+will work.
+
+#### External Dependencies
+
+Given that LTS Haskell and Stackage Nightly have ~1400 of the most common
+Haskell packages, this will often be enough to build most packages. However,
+at times, you may find that not all dependencies required may be available in
+the Stackage snapshots.
+
+Let's simulate an unsatisfied dependency by adding acme-missiles to our
+build-depends and re-initing:
 
 ```
-michael@d30748af6d3d:~/yackage-0.8.0$ stack init --force
-Writing default config file to: /home/michael/yackage-0.8.0/stack.yaml
-Basing on cabal files:
-- /home/michael/yackage-0.8.0/yackage.cabal
+cueball:~/yackage-0.8.0$ stack init --force
+Using cabal packages:
+- yackage.cabal
 
-Checking against build plan lts-3.2
+Selecting the best among 6 snapshots...
 
-* Build plan did not match your requirements:
+* Partially matches lts-4.1
     acme-missiles not found
-    - yackage requires -any
+        - yackage requires -any
+        - yackage flags: upload = True
 
-Checking against build plan lts-3.1
-
-* Build plan did not match your requirements:
+* Partially matches nightly-2016-01-16
     acme-missiles not found
-    - yackage requires -any
+        - yackage requires -any
+        - yackage flags: upload = True
 
-
-Checking against build plan nightly-2015-08-26
-
-* Build plan did not match your requirements:
+* Partially matches lts-3.22
     acme-missiles not found
-    - yackage requires -any
+        - yackage requires -any
+        - yackage flags: upload = True
 
+.
+.
+.
 
-Checking against build plan lts-2.22
-
-* Build plan did not match your requirements:
+Selected resolver: lts-4.1
+Resolver 'lts-4.1' does not have all the packages to match your requirements.
     acme-missiles not found
-    - yackage requires -any
+        - yackage requires -any
+        - yackage flags: upload = True
 
-    warp version 3.0.13.1 found
-    - yackage requires >=3.1
-
-
-There was no snapshot found that matched the package bounds in your .cabal files.
-Please choose one of the following commands to get started.
-
-    stack init --resolver lts-3.2
-    stack init --resolver lts-3.1
-    stack init --resolver nightly-2015-08-26
-    stack init --resolver lts-2.22
-
-You'll then need to add some extra-deps. See the
-[stack.yaml documentation](yaml_configuration.md#extra-deps).
-
-You can also try falling back to a dependency solver with:
-
-    stack init --solver
+However, you can try '--solver' to use external packages.
 ```
 
-stack has tested four different snapshots, and in every case discovered that
-acme-missiles is not available. Also, when testing lts-2.22, it found that the
-warp version provided was too old for yackage. So, what do we do?
+stack has tested six different snapshots, and in every case discovered that
+acme-missiles is not available. In the end it suggested that you use the
+`--solver` command line switch if you want to use packages outside Stackage. So
+let's give it a try:
 
-The recommended approach is: pick a resolver, and fix the problem. Again,
-following the advice mentioned above, default to LTS if you don't have a
-preference. In this case, the newest LTS listed is lts-3.2. Let's pick that.
-stack has told us the correct command to do this. We'll just remove our old
-stack.yaml first and then run it:
 
 ```
-michael@d30748af6d3d:~/yackage-0.8.0$ rm stack.yaml
-michael@d30748af6d3d:~/yackage-0.8.0$ stack init --resolver lts-3.2
-Writing default config file to: /home/michael/yackage-0.8.0/stack.yaml
-Basing on cabal files:
-- /home/michael/yackage-0.8.0/yackage.cabal
+cueball:~/yackage-0.8.0$ stack init --force --solver
+Using cabal packages:
+- yackage.cabal
 
-Checking against build plan lts-3.2
+Selecting the best among 6 snapshots...
 
-* Build plan did not match your requirements:
+* Partially matches lts-4.1
     acme-missiles not found
-    - yackage requires -any
+        - yackage requires -any
+        - yackage flags: upload = True
 
+.
+.
+.
 
-Selected resolver: lts-3.2
-Wrote project config to: /home/michael/yackage-0.8.0/stack.yaml
+Selected resolver: lts-4.1
+*** Resolver lts-4.1 will need external packages:
+    acme-missiles not found
+        - yackage requires -any
+        - yackage flags: upload = True
+
+Using resolver: lts-4.1
+Using compiler: ghc-7.10.3
+Asking cabal to calculate a build plan...
+Trying with packages from lts-4.1 as hard constraints...
+Successfully determined a build plan with 3 external dependencies.
+Initialising configuration using resolver: lts-4.1
+Total number of user packages considered: 1
+Warning! 3 external dependencies were added.
+Overwriting existing configuration file: stack.yaml
+All done.
 ```
 
-As you may guess, `stack build` will now fail due to the missing acme-missiles.
-Toward the end of the error message, it says the familiar:
+As you can verify by viewing stack.yaml, three external dependencies were added
+by stack init:
 
 ```
-Recommended action: try adding the following to your extra-deps in /home/michael/yackage-0.8.0/stack.yaml
-- acme-missiles-0.3
-```
-
-If you're following along at home, try making the necessary stack.yaml
-modification to get things building.
-
-### Alternative solution: dependency solving
-
-There's another solution to consider for missing dependencies. At the end
-of the previous error message, it said:
-
-```
-You may also want to try the 'stack solver' command
-```
-
-This approach uses a full-blown dependency solver to look at all upstream
-package versions available and compare them to your snapshot selection and
-version ranges in your .cabal file. In order to use this feature, you'll need
-the cabal executable available. Let's build that with:
-
-```
-michael@d30748af6d3d:~/yackage-0.8.0$ stack build cabal-install
-random-1.1: download
-mtl-2.2.1: download
-network-2.6.2.1: download
-old-locale-1.0.0.7: download
-random-1.1: configure
-random-1.1: build
-# ...
-cabal-install-1.22.6.0: download
-cabal-install-1.22.6.0: configure
-cabal-install-1.22.6.0: build
-cabal-install-1.22.6.0: install
-Completed all 10 actions.
-```
-
-Now we can use `stack solver`:
-
-```
-michael@d30748af6d3d:~/yackage-0.8.0$ stack solver
-This command is not guaranteed to give you a perfect build plan
-It's possible that even with the changes generated below, you will still need to do some manual tweaking
-Asking cabal to calculate a build plan, please wait
+# Packages to be pulled from upstream that are not in the resolver (e.g., acme-missiles-0.3)
 extra-deps:
 - acme-missiles-0.3
+- text-1.2.2.0
+- yaml-0.8.15.2
 ```
 
-And if we're exceptionally lazy, we can ask stack to modify our stack.yaml file
-for us:
+Of course, you could have added the external dependencies by manually editing
+stack.yaml but stack init does the hard work for you.
+
+#### Excluded Packages
+
+Sometimes multiple packages in your project may have conflicting requirements.
+In that case `stack init` will fail, so what do you do?
+
+You could manually create stack.yaml by omitting some packages to resolve the
+conflict. Alternatively you can ask `stack init` to do that for you by
+specifying `--omit-packages` flag on the command line. Let's see how that
+works.
+
+To simulate a conflict we will use acme-missiles-0.3 in yackage and we will
+also copy yackage.cabal to another directory and change the name of the file
+and package to yackage-test. In this new package we will use acme-missiles-0.2
+instead. Let's see what happens when we run solver:
 
 ```
-michael@d30748af6d3d:~/yackage-0.8.0$ stack solver --modify-stack-yaml
-This command is not guaranteed to give you a perfect build plan
-It's possible that even with the changes generated below, you will still need to do some manual tweaking
-Asking cabal to calculate a build plan, please wait
-extra-deps:
-- acme-missiles-0.3
-Updated /home/michael/yackage-0.8.0/stack.yaml
+cueball:~/yackage-0.8.0$ stack init --force --solver --omit-packages
+Using cabal packages:
+- yackage.cabal
+- example/yackage-test.cabal
+
+Selecting the best among 6 snapshots...
+
+* Partially matches lts-4.2
+    acme-missiles not found
+        - yackage requires ==0.3
+        - yackage-test requires ==0.2
+        - yackage flags: upload = True
+        - yackage-test flags: upload = True
+.
+.
+.
+
+*** Failed to arrive at a workable build plan.
+*** Ignoring package: yackage-test
+*** Resolver lts-4.2 will need external packages:
+    acme-missiles not found
+        - yackage requires ==0.3
+        - yackage flags: upload = True
+
+Using resolver: lts-4.2
+Using compiler: ghc-7.10.3
+Asking cabal to calculate a build plan...
+Trying with packages from lts-4.2 as hard constraints...
+Successfully determined a build plan with 3 external dependencies.
+Initialising configuration using resolver: lts-4.2
+Total number of user packages considered: 2
+Warning! Ignoring 1 packages due to dependency conflicts:
+        - "example/yackage-test.cabal"
+
+Warning! 3 external dependencies were added.
+Overwriting existing configuration file: stack.yaml
+All done.
 ```
 
-With that change, `stack build` will now run.
+Looking at `stack.yaml`, you will see that the excluded packages have been
+commented out:
+
+```
+# Local packages, usually specified by relative directory name
+packages:
+- '.'
+# The following packages have been ignored due to incompatibility with the resolver compiler or dependency conflicts with other packages
+#- example/
+```
+
+In case wrong packages are excluded you can uncomment the right one and comment
+the other one.
+
+Packages may get excluded due to conflicting requirements among user packages
+or due to conflicting requirements between a user package and the resolver
+compiler. If all of the packages have a conflict with the compiler then all of
+them may get commented out.
+
+When packages are commented out you will see a warning every time you run a
+command which needs the config file. The warning can be disabled by editing the
+config file and removing it.
+
+#### Using a specific resolver
+
+Sometimes you may want to use a specific resolver for your project instead of
+`stack init` picking one for you. You can do that by using `stack init
+--resolver <resolver>`.
+
+You can also init with a compiler resolver if you do not want to use a
+snapshot. That will result in all of your project's dependencies being put
+under the `extra-deps` section.
+
+#### Installing the compiler
+
+You can install the required compiler if not already installed by using the
+`--install-ghc` flag with the `stack init` command.
+
+#### Miscellaneous and diagnostics
+
+_Add selected packages_: If you want to use only selected packages from your
+project directory you can do so by explicitly specifying the package directories
+on the command line.
+
+_Duplicate package names_: If multiple packages under the directory tree have
+same name, stack init will report those and automatically ignore one of them.
+
+_Ignore subdirectories_: By default stack init searches all the subdirectories
+for .cabal files. If you do not want that then you can use `--ignore-subdirs`
+command line switch.
+
+_Cabal warnings_: stack init will show warnings if there were issues in reading
+a cabal package file. You may want to pay attention to the warnings as
+sometimes they may result in incomprehensible errors later on during dependency
+solving.
+
+_Package naming_: If the `Name` field defined in a cabal file does not match
+with the cabal file name then `stack init` will refuse to continue.
+
+_Cabal install errors_: stack init uses `cabal-install` to determine external
+dependencies. When cabal-install encounters errors, cabal errors are displayed
+as is by stack init for diagnostics.
+
+_User warnings_: When packages are excluded or external dependencies added
+stack will show warnings every time configuration file is loaded. You can
+suppress the warnings by editing the config file and removing the warnings from
+it. You may see something like this:
+
+```
+cueball:~/yackage-0.8.0$ stack build
+Warning: Some packages were found to be incompatible with the resolver and have been left commented out in the packages section.
+Warning: Specified resolver could not satisfy all dependencies. Some external packages have been added as dependencies.
+You can suppress this message by removing it from stack.yaml
+
+```
+### stack solver
+
+While `stack init` is used to create stack configuration file from existing
+cabal files, `stack solver` can be used to fine tune or fix an existing stack
+configuration file.
+
+`stack solver` uses the existing file as a constraint. For example it will
+use only those packages specified in the existing config file or use existing
+external dependencies as constraints to figure out other dependencies.
+
+Let's try `stack solver` to verify the config that we generated earlier with
+`stack init`:
+
+```
+cueball:~/yackage-0.8.0$ stack solver
+Using configuration file: stack.yaml
+The following packages are missing from the config:
+- example/yackage-test.cabal
+
+Using cabal packages:
+- yackage.cabal
+
+Using resolver: lts-4.2
+Using compiler: ghc-7.10.3
+Asking cabal to calculate a build plan...
+Trying with packages from lts-4.2 and 3 external packages as hard constraints...
+Successfully determined a build plan with 3 external dependencies.
+No changes needed to stack.yaml
+```
+
+It says there are no changes needed to your config. Notice that it also reports
+`example/yackage-test.cabal` as missing from the config. It was purposely
+omitted by `stack init` to resolve a conflict.
+
+Sometimes `stack init` may not be able to give you a perfect configuration. In
+that case, you can tweak the configuration file as per your requirements and then
+run `stack solver`, it will check the file and suggest or apply any fixes
+needed.
+
+For example, if `stack init` ignored certain packages due to name conflicts or
+dependency conflicts, the choice that `stack init` made may not be the correct
+one. In that case you can revert the choice and use solver to fix things.
+
+Let's try commenting out `.` and uncommenting `examples/` in our previously
+generated `stack.yaml` and then run `stack solver`:
+
+```
+cueball:~/yackage-0.8.0$ stack solver
+
+Using configuration file: stack.yaml
+The following packages are missing from the config:
+- yackage.cabal
+
+Using cabal packages:
+- example/yackage-test.cabal
+
+.
+.
+.
+
+Retrying with packages from lts-4.2 and 3 external packages as preferences...
+Successfully determined a build plan with 5 external dependencies.
+
+The following changes will be made to stack.yaml:
+* Resolver is lts-4.2
+* Dependencies to be added
+    extra-deps:
+    - acme-missiles-0.2
+    - email-validate-2.2.0
+    - tar-0.5.0.1
+
+* Dependencies to be deleted
+    extra-deps:
+    - acme-missiles-0.3
+
+To automatically update stack.yaml, rerun with '--update-config'
+```
+
+Due to the change that we made, solver suggested some new dependencies.
+By default it does not make changes to the config. As it suggested you can use
+`--update-config` to make changes to the config.
 
 NOTE: You should probably back up your stack.yaml before doing this, such as
 committing to Git/Mercurial/Darcs.
 
-There's one final approach to mention: skipping the snapshot entirely and just
-using dependency solving. You can do this with the `--solver` flag to `init`.
-This is not a commonly used workflow with stack, as you end up with a large
-number of extra-deps and no guarantee that the packages will compile together.
-For those interested, however, the option is available. You need to make sure
-you have both the ghc and cabal commands on your PATH. An easy way to do this
-is to use the `stack exec` command:
+Sometimes, you may want to use specific versions of certain packages for your
+project. To do that you can fix those versions by specifying them in the
+extra-deps section and then use `stack solver` to figure out whether it is
+feasible to use those or what other dependencies are needed as a result.
+
+If you want to change the resolver for your project, you can run `stack solver
+--resolver <resolver name>` and it will figure out the changes needed for you.
+
+Let's see what happens if we change the resolver to lts-2.22:
 
 ```
-michael@d30748af6d3d:~/yackage-0.8.0$ stack exec -- stack init --solver --force
-Writing default config file to: /home/michael/yackage-0.8.0/stack.yaml
-Basing on cabal files:
-- /home/michael/yackage-0.8.0/yackage.cabal
+cueball:~/yackage-0.8.0$ stack solver --resolver lts-2.22
+Using configuration file: stack.yaml
+The following packages are missing from the config:
+- yackage.cabal
 
-Asking cabal to calculate a build plan, please wait
-Selected resolver: ghc-7.10
-Wrote project config to: /home/michael/yackage-0.8.0/stack.yaml
+Using cabal packages:
+- example/yackage-test.cabal
+
+Using resolver: lts-2.22
+Using compiler: ghc-7.8.4
+
+.
+.
+.
+
+Retrying with packages from lts-2.22 and 3 external packages as preferences...
+Successfully determined a build plan with 19 external dependencies.
+
+The following changes will be made to stack.yaml:
+* Resolver is lts-2.22
+* Flags to be added
+    flags:
+    - old-locale: true
+
+* Dependencies to be added
+    extra-deps:
+    - acme-missiles-0.2
+    - aeson-0.10.0.0
+    - aeson-compat-0.3.0.0
+    - attoparsec-0.13.0.1
+    - conduit-extra-1.1.9.2
+    - email-validate-2.2.0
+    - hex-0.1.2
+    - http-api-data-0.2.2
+    - http2-1.1.0
+    - persistent-2.2.4
+    - persistent-template-2.1.5
+    - primitive-0.6.1.0
+    - tar-0.5.0.1
+    - unix-time-0.3.6
+    - vector-0.11.0.0
+    - wai-extra-3.0.14
+    - warp-3.1.3.1
+
+* Dependencies to be deleted
+    extra-deps:
+    - acme-missiles-0.3
+
+To automatically update stack.yaml, rerun with '--update-config'
 ```
+
+As you can see, it automatically suggested changes in `extra-deps` due to the
+change of resolver.
 
 ## Different databases
 
@@ -1354,10 +1555,20 @@ instead of creating an entire Cabal package for it. You can use `stack exec
 ghc` or `stack exec runghc` for that. As simple helpers, we also provide the
 `stack ghc` and `stack runghc` commands, for these common cases.
 
+## script interpreter
+
 stack also offers a very useful feature for running files: a script
 interpreter. For too long have Haskellers felt shackled to bash or Python
 because it's just too hard to create reusable source-only Haskell scripts.
-stack attempts to solve that. An example will be easiest to understand:
+stack attempts to solve that.
+
+You can use `stack <file name>` to execute a Haskell source file or specify
+`stack` as the interpreter using a shebang line on a Unix like operating systems.
+Additional stack options can be specified using a special Haskell comment in
+the source file to specify dependencies and automatically install them before
+running the file.
+
+An example will be easiest to understand:
 
 ```
 michael@d30748af6d3d:~$ cat turtle.hs
@@ -1380,19 +1591,42 @@ Using resolver: lts-3.2 specified on command line
 Hello World!
 ```
 
-If you're on Windows: you can run `stack turtle.hs` instead of `./turtle.hs`.
-
-The first line is the usual "shebang" to use stack as a script interpreter. The
-second line, which is required, provides additional options to stack (due to
-the common limitation of the "shebang" line only being allowed a single
-argument). In this case, the options tell stack to use the lts-3.2 resolver,
-automatically install GHC if it is not already installed, and ensure the turtle
-package is available.
-
 The first run can take a while (as it has to download GHC if necessary and build
 dependencies), but subsequent runs are able to reuse everything already built,
 and are therefore quite fast.
 
+The first line in the source file is the usual "shebang" to use stack as a
+script interpreter. The second line, is a Haskell comment providing additional
+options to stack (due to the common limitation of the "shebang" line only being
+allowed a single argument). In this case, the options tell stack to use the
+lts-3.2 resolver, automatically install GHC if it is not already installed, and
+ensure the turtle package is available.
+
+If you're on Windows: you can run `stack turtle.hs` instead of `./turtle.hs`.
+The shebang line is not required in that case.
+
+### Specifying interpreter options
+
+The stack interpreter options comment must specify a single valid stack command
+line, starting with `stack` as the command followed by the stack options to use
+for executing this file. The comment must always be on the line immediately
+following the shebang line when the shebang line is present otherwise it must
+be the first line in the file. The comment must always start in the first
+column of the line.
+
+When many options are needed a block style comment may be more convenient to
+split the command on multiple lines for better readability. Here is an example
+of a multi line block comment:
+
+```
+  #!/usr/bin/env stack
+  {- stack
+    --resolver lts-3.2
+    --install-ghc
+    runghc
+    --package turtle
+  -}
+```
 ## Finding project configs, and the implicit global
 
 Whenever you run something with stack, it needs a stack.yaml project file. The
@@ -1509,7 +1743,7 @@ There are lots of resources available for learning more about stack:
 * `stack --help`
 * `stack --version` — identify the version and Git hash of the stack executable
 * `--verbose` (or `-v`) — much more info about internal operations (useful for bug reports)
-* The [README](https://github.com/commercialhaskell/stack#readme)
+* The [home page](http://haskellstack.org)
 * The [stack mailing list](https://groups.google.com/d/forum/haskell-stack)
 * The [the FAQ](faq.md)
 * The [stack wiki](https://github.com/commercialhaskell/stack/wiki)
@@ -1573,47 +1807,157 @@ can use the `stack dot` command and Graphviz. More information is
 ### Travis with caching
 
 Many people use Travis CI to test out a project for every Git push. We have [a
-Wiki page devoted to
-Travis](https://github.com/commercialhaskell/stack/wiki/Travis). However, for
+document devoted to
+Travis](travis_ci.md). However, for
 most people, the following example will be sufficient to get started:
 
 ```yaml
+# Copy these contents into the root directory of your Github project in a file
+# named .travis.yml
+
 # Use new container infrastructure to enable caching
 sudo: false
 
 # Choose a lightweight base image; we provide our own build tools.
 language: c
 
-# GHC depends on GMP. You can add other dependencies here as well.
-addons:
-  apt:
-    packages:
-    - libgmp-dev
-
-# The different configurations we want to test. You could also do things like
-# change flags or use --stack-yaml to point to a different file.
-env:
-- ARGS=""
-- ARGS="--resolver lts-2"
-- ARGS="--resolver lts-3"
-- ARGS="--resolver lts"
-- ARGS="--resolver nightly"
-
-before_install:
-# Download and unpack the stack executable
-- mkdir -p ~/.local/bin
-- export PATH=$HOME/.local/bin:$PATH
-- travis_retry curl -L https://www.stackage.org/stack/linux-x86_64 | tar xz --wildcards --strip-components=1 -C ~/.local/bin '*/stack'
-
-# This line does all of the work: installs GHC if necessary, build the library,
-# executables, and test suites, and runs the test suites. --no-terminal works
-# around some quirks in Travis's terminal implementation.
-script: stack $ARGS --no-terminal --install-ghc test --haddock
-
 # Caching so the next build will be fast too.
 cache:
   directories:
+  - $HOME/.ghc
+  - $HOME/.cabal
   - $HOME/.stack
+
+# The different configurations we want to test. We have BUILD=cabal which uses
+# cabal-install, and BUILD=stack which uses Stack. More documentation on each
+# of those below.
+#
+# We set the compiler values here to tell Travis to use a different
+# cache file per set of arguments.
+#
+# If you need to have different apt packages for each combination in the
+# matrix, you can use a line such as:
+#     addons: {apt: {packages: [libfcgi-dev,libgmp-dev]}}
+matrix:
+  include:
+  # We grab the appropriate GHC and cabal-install versions from hvr's PPA. See:
+  # https://github.com/hvr/multi-ghc-travis
+  - env: BUILD=cabal GHCVER=7.0.4 CABALVER=1.16
+    compiler: ": #GHC 7.0.4"
+    addons: {apt: {packages: [cabal-install-1.16,ghc-7.0.4], sources: [hvr-ghc]}}
+  - env: BUILD=cabal GHCVER=7.2.2 CABALVER=1.16
+    compiler: ": #GHC 7.2.2"
+    addons: {apt: {packages: [cabal-install-1.16,ghc-7.2.2], sources: [hvr-ghc]}}
+  - env: BUILD=cabal GHCVER=7.4.2 CABALVER=1.16
+    compiler: ": #GHC 7.4.2"
+    addons: {apt: {packages: [cabal-install-1.16,ghc-7.4.2], sources: [hvr-ghc]}}
+  - env: BUILD=cabal GHCVER=7.6.3 CABALVER=1.16
+    compiler: ": #GHC 7.6.3"
+    addons: {apt: {packages: [cabal-install-1.16,ghc-7.6.3], sources: [hvr-ghc]}}
+  - env: BUILD=cabal GHCVER=7.8.4 CABALVER=1.18
+    compiler: ": #GHC 7.8.4"
+    addons: {apt: {packages: [cabal-install-1.18,ghc-7.8.4], sources: [hvr-ghc]}}
+  - env: BUILD=cabal GHCVER=7.10.3 CABALVER=1.22
+    compiler: ": #GHC 7.10.3"
+    addons: {apt: {packages: [cabal-install-1.22,ghc-7.10.3], sources: [hvr-ghc]}}
+
+  # Build with the newest GHC and cabal-install. This is an accepted failure,
+  # see below.
+  - env: BUILD=cabal GHCVER=head  CABALVER=head
+    compiler: ": #GHC HEAD"
+    addons: {apt: {packages: [cabal-install-head,ghc-head], sources: [hvr-ghc]}}
+
+  # The Stack builds. We can pass in arbitrary Stack arguments via the ARGS
+  # variable, such as using --stack-yaml to point to a different file.
+  - env: BUILD=stack ARGS="--resolver lts-2"
+    compiler: ": #stack 7.8.4"
+    addons: {apt: {packages: [ghc-7.8.4], sources: [hvr-ghc]}}
+
+  - env: BUILD=stack ARGS="--resolver lts-3"
+    compiler: ": #stack 7.10.2"
+    addons: {apt: {packages: [ghc-7.10.2], sources: [hvr-ghc]}}
+
+  - env: BUILD=stack ARGS="--resolver lts-5"
+    compiler: ": #stack 7.10.3"
+    addons: {apt: {packages: [ghc-7.10.3], sources: [hvr-ghc]}}
+
+  # Nightly builds are allowed to fail
+  - env: BUILD=stack ARGS="--resolver nightly"
+    compiler: ": #stack nightly"
+    addons: {apt: {packages: [libgmp-dev]}}
+
+  # Build on OS X in addition to Linux
+  - env: BUILD=stack ARGS="--resolver lts-2"
+    compiler: ": #stack 7.8.4 osx"
+    os: osx
+
+  - env: BUILD=stack ARGS="--resolver lts-3"
+    compiler: ": #stack 7.10.2 osx"
+    os: osx
+
+  - env: BUILD=stack ARGS="--resolver lts-5"
+    compiler: ": #stack 7.10.3 osx"
+    os: osx
+
+  - env: BUILD=stack ARGS="--resolver nightly"
+    compiler: ": #stack nightly osx"
+    os: osx
+
+  allow_failures:
+  - env: BUILD=cabal GHCVER=head  CABALVER=head
+  - env: BUILD=stack ARGS="--resolver nightly"
+
+before_install:
+# Using compiler above sets CC to an invalid value, so unset it
+- unset CC
+
+# We want to always allow newer versions of packages when building on GHC HEAD
+- CABALARGS=""
+- if [ "x$GHCVER" = "xhead" ]; then CABALARGS=--allow-newer; fi
+
+# Download and unpack the stack executable
+- export PATH=/opt/ghc/$GHCVER/bin:/opt/cabal/$CABALVER/bin:$HOME/.local/bin:$PATH
+- mkdir -p ~/.local/bin
+- |
+  if [ `uname` = "Darwin" ]
+  then
+    curl --insecure -L https://www.stackage.org/stack/osx-x86_64 | tar xz --strip-components=1 --include '*/stack' -C ~/.local/bin
+  else
+    curl -L https://www.stackage.org/stack/linux-x86_64 | tar xz --wildcards --strip-components=1 -C ~/.local/bin '*/stack'
+  fi
+
+install:
+- echo "$(ghc --version) [$(ghc --print-project-git-commit-id 2> /dev/null || echo '?')]"
+- if [ -f configure.ac ]; then autoreconf -i; fi
+- |
+  case "$BUILD" in
+    stack)
+      stack --no-terminal --install-ghc $ARGS test --only-dependencies
+      ;;
+    cabal)
+      cabal --version
+      travis_retry cabal update
+      cabal install --only-dependencies --enable-tests --enable-benchmarks --force-reinstalls --ghc-options=-O0 --reorder-goals --max-backjumps=-1 $CABALARGS
+      ;;
+  esac
+
+script:
+- |
+  case "$BUILD" in
+    stack)
+      stack --no-terminal $ARGS test --haddock --no-haddock-deps
+      ;;
+    cabal)
+      cabal configure --enable-tests --enable-benchmarks -v2 --ghc-options="-O0 -Werror"
+      cabal build
+      cabal check || [ "$CABALVER" == "1.16" ]
+      cabal test
+      cabal sdist
+      cabal copy
+      SRC_TGZ=$(cabal info . | awk '{print $2;exit}').tar.gz && \
+        (cd dist && cabal install --force-reinstalls "$SRC_TGZ")
+      ;;
+  esac
 ```
 
 Not only will this build and test your project against multiple GHC versions
@@ -1633,14 +1977,14 @@ In case you're wondering: we need `--no-terminal` because stack does some fancy
 sticky display on smart terminals to give nicer status and progress messages,
 and the terminal detection is broken on Travis.
 
-### Shell autocompletion
+### Shell auto-completion
 
 Love tab-completion of commands? You're not alone. If you're on bash, just run
 the following (or add it to `.bashrc`):
 
-    eval "$(stack --bash-completion-script "$(which stack)")"
+    eval "$(stack --bash-completion-script stack)"
 
-For more information and other shells, see [the Shell autocompletion wiki
+For more information and other shells, see [the Shell auto-completion wiki
 page](https://github.com/commercialhaskell/stack/wiki/Shell-autocompletion)
 
 ### Docker
@@ -1686,6 +2030,40 @@ image:
 and then run `stack image container` and then `docker images` to list
 the images.
 
+### Nix
+
+stack provides an integration with [Nix](http://nixos.org/nix),
+providing you with the same two benefits as the first Docker
+integration discussed above:
+
+* more reproducible builds, since fixed versions of any system
+  libraries and commands required to build the project are
+  automatically built using Nix and managed locally per-project. These
+  system packages never conflict with any existing versions of these
+  libraries on your system. That they are managed locally to the
+  project means that you don't need to alter your system in any way to
+  build any odd project pulled from the Internet.
+* implicit sharing of system packages between projects, so you don't
+  have more copies on-disk than you need to.
+
+When using the Nix integration, Stack downloads and builds Haskell dependencies
+as usual, but resorts on Nix to provide non-Haskell dependencies that exist in
+the Nixpkgs.
+
+Both Docker and Nix are methods to *isolate* builds and thereby make
+them more reproducible. They just differ in the means of achieving
+this isolation. Nix provides slightly weaker isolation guarantees than
+Docker, but is more lightweight and more portable (Linux and OS
+X mainly, but also Windows). For more on Nix, its command-line
+interface and its package description language, read the
+[Nix manual](http://nixos.org/nix/manual). But keep in mind that the
+point of stack's support is to obviate the need to write any Nix code
+in the common case or even to learn how to use the Nix tools (they're
+called under the hood).
+
+For more information, see
+[the Nix-integration documentation](nix_integration.md).
+
 ## Power user commands
 
 The following commands are a little more powerful, and won't be needed by all
@@ -1703,6 +2081,9 @@ users. Here's a quick rundown:
 * `stack upload` uploads an sdist to Hackage. In the future, it will also
   perform automatic GPG signing of your packages for additional security, when
   configured.
+    * `--sign` provides a way to GPG sign your package & submit the result to
+      sig.commercialhaskell.org for storage in the sig-archive git
+      repo. (Signatures will be used later to verify package integrity.)
 * `stack upgrade` will build a new version of stack from source.
     * `--git` is a convenient way to get the most recent version from master for
       those testing and living on the bleeding edge.
@@ -1712,6 +2093,10 @@ users. Here's a quick rundown:
   but it can be useful if you're trying to test a specific bugfix.
 * `stack list-dependencies` lists all of the packages and versions used for a
   project
+* `stack sig` subcommand can help you with GPG signing & verification
+    * `sign` will sign an sdist tarball and submit the signature to
+      sig.commercialhaskell.org for storage in the sig-archive git repo.
+      (Signatures will be used later to verify package integrity.)
 
 ## Debugging
 
@@ -1729,6 +2114,11 @@ of a program called `main` compiled with the above command, you can run
 `./main +RTS -p`
 
 to generate a `main.prof` file containing the requested profiling information.
+Alternatively, you can use `stack exec main -- +RTS -p`, where `--` allows you
+to specify parameters for `main` executable (without `--` the `stack`
+executable would use those parameters instead).
+
+
 For more commands and uses, see [the official GHC chapter on
 profiling](https://downloads.haskell.org/~ghc/latest/docs/html/users_guide/profiling.html),
 [the Haskell wiki](https://wiki.haskell.org/How_to_profile_a_Haskell_program),

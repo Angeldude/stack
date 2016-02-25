@@ -1,6 +1,7 @@
 {-# LANGUAGE CPP                   #-}
 {-# LANGUAGE DeriveDataTypeable    #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE PackageImports        #-}
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE RecordWildCards       #-}
@@ -31,7 +32,7 @@ import Control.Monad.IO.Class
 import Control.Monad.Reader
 import Control.Retry (recovering,limitRetries,RetryPolicy,constantDelay)
 import Control.Applicative
-import Crypto.Hash
+import "cryptohash" Crypto.Hash
 import Crypto.Hash.Conduit (sinkHash)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 (readInteger)
@@ -242,8 +243,8 @@ verifiedDownload DownloadRequest{..} destpath progressSink = do
     -- precondition: file exists
     -- TODO: add logging
     fileMatchesExpectations =
-        (checkExpectations >> return True)
-          `catch` \(_ :: VerifyFileException) -> return False
+        ((checkExpectations >> return True)
+          `catch` \(_ :: VerifyFileException) -> return False)
           `catch` \(_ :: VerifiedDownloadException) -> return False
 
     checkExpectations = bracket (openFile fp ReadMode) hClose $ \h -> do

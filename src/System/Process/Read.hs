@@ -14,6 +14,7 @@ module System.Process.Read
   ,tryProcessStdout
   ,sinkProcessStdout
   ,sinkProcessStderrStdout
+  ,sinkProcessStderrStdoutHandle
   ,readProcess
   ,EnvOverride(..)
   ,unEnvOverride
@@ -34,11 +35,10 @@ module System.Process.Read
   )
   where
 
-import           Control.Applicative
 import           Control.Arrow ((***), first)
-import           Control.Concurrent.Async (Concurrently (..))
+import           Control.Concurrent.Async (concurrently)
 import           Control.Exception hiding (try, catch)
-import           Control.Monad (join, liftM)
+import           Control.Monad (join, liftM, unless)
 import           Control.Monad.Catch (MonadThrow, MonadCatch, throwM, try, catch)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Control.Monad.Logger (MonadLogger, logError)
@@ -53,7 +53,7 @@ import           Data.Foldable (forM_)
 import           Data.IORef
 import           Data.Map (Map)
 import qualified Data.Map as Map
-import           Data.Maybe (isJust)
+import           Data.Maybe (isJust, maybeToList)
 import           Data.Monoid
 import           Data.Text (Text)
 import qualified Data.Text as T
@@ -62,13 +62,14 @@ import qualified Data.Text.Lazy.Encoding as LT
 import qualified Data.Text.Lazy as LT
 import           Data.Typeable (Typeable)
 import           Distribution.System (OS (Windows), Platform (Platform))
-import           Path (Path, Abs, Dir, toFilePath, File, parseAbsFile)
-import           Path.IO (createTree, parseRelAsAbsFile)
+import           Path
+import           Path.IO hiding (findExecutable)
 import           Prelude -- Fix AMP warning
-import           System.Directory (doesFileExist, getCurrentDirectory)
+import qualified System.Directory as D
 import           System.Environment (getEnvironment)
 import           System.Exit
 import qualified System.FilePath as FP
+import           System.IO (Handle)
 import           System.Process.Log
 
 -- | Override the environment received by a child process.
@@ -141,7 +142,7 @@ readProcessNull wd menv name args =
     sinkProcessStdout wd menv name args CL.sinkNull
 
 -- | Run the given command in the given directory. If it exits with anything
--- but success, prints an error and then calls 'exitWith' to exit the program.
+-- but success, print an error and then call 'exitWith' to exit the program.
 readInNull :: (MonadIO m, MonadLogger m, MonadBaseControl IO m, MonadCatch m)
            => Path Abs Dir -- ^ Directory to run in
            -> FilePath -- ^ Command to run
@@ -152,18 +153,12 @@ readInNull :: (MonadIO m, MonadLogger m, MonadBaseControl IO m, MonadCatch m)
 readInNull wd cmd menv args errMsg = do
     result <- try (readProcessNull (Just wd) menv cmd args)
     case result of
-        Left (ProcessExitedUnsuccessfully _ ec) -> do
-            $logError $
-                T.pack $
-                concat
-                    [ "Exit code "
-                    , show ec
-                    , " while running "
-                    , show (cmd : args)
-                    , " in "
-                    , toFilePath wd]
-            forM_ errMsg $logError
-            liftIO (exitWith ec)
+        Left ex -> do
+            $logError (T.pack (show ex))
+            case ex of
+                ReadProcessException{} -> forM_ errMsg $logError
+                _ -> return ()
+            liftIO exitFailure
         Right () -> return ()
 
 -- | Try to produce a strict 'S.ByteString' from the stdout of a
@@ -179,7 +174,7 @@ tryProcessStdout wd menv name args =
 
 -- | Produce a strict 'S.ByteString' from the stdout of a process.
 --
--- Throws a 'ProcessExitedUnsuccessfully' exception if the  process fails.
+-- Throws a 'ReadProcessException' exception if the  process fails.
 readProcessStdout :: (MonadIO m, MonadLogger m, MonadBaseControl IO m, MonadCatch m)
                   => Maybe (Path Abs Dir) -- ^ Optional directory to run in
                   -> EnvOverride
@@ -198,12 +193,13 @@ data ReadProcessException
     | ExecutableNotFoundAt FilePath
     deriving Typeable
 instance Show ReadProcessException where
-    show (ReadProcessException cp ec out err) = concat
+    show (ReadProcessException cp ec out err) = concat $
         [ "Running "
-        , showSpec $ cmdspec cp
-        , " exited with "
+        , showSpec $ cmdspec cp] ++
+        maybe [] (\x -> [" in directory ", x]) (cwd cp) ++
+        [ " exited with "
         , show ec
-        , "\n"
+        , "\n\n"
         , toStr out
         , "\n"
         , toStr err
@@ -261,7 +257,7 @@ sinkProcessStdout wd menv name args sinkStdout = do
   return sinkRet
 
 -- | Consume the stdout and stderr of a process feeding strict 'S.ByteString's to the consumers.
-sinkProcessStderrStdout :: (MonadIO m, MonadLogger m)
+sinkProcessStderrStdout :: forall m e o. (MonadIO m, MonadLogger m)
                         => Maybe (Path Abs Dir) -- ^ Optional directory to run in
                         -> EnvOverride
                         -> String -- ^ Command
@@ -272,54 +268,73 @@ sinkProcessStderrStdout :: (MonadIO m, MonadLogger m)
 sinkProcessStderrStdout wd menv name args sinkStderr sinkStdout = do
   $logProcessRun name args
   name' <- preProcess wd menv name
-  liftIO (withCheckedProcess
-            (proc name' args) { env = envHelper menv, cwd = fmap toFilePath wd }
-            (\ClosedStream out err ->
-               runConcurrently $
-               (,) <$>
-               Concurrently (asBSSource err $$ sinkStderr) <*>
-               Concurrently (asBSSource out $$ sinkStdout)))
-  where asBSSource :: Source m S.ByteString -> Source m S.ByteString
-        asBSSource = id
+  liftIO $ withCheckedProcess
+      (proc name' args) { env = envHelper menv, cwd = fmap toFilePath wd }
+      (\ClosedStream out err -> f err out)
+  where
+    f :: Source IO S.ByteString -> Source IO S.ByteString -> IO (e, o)
+    f err out = (err $$ sinkStderr) `concurrently` (out $$ sinkStdout)
+
+sinkProcessStderrStdoutHandle :: (MonadIO m, MonadLogger m)
+                              => Maybe (Path Abs Dir) -- ^ Optional directory to run in
+                              -> EnvOverride
+                              -> String -- ^ Command
+                              -> [String] -- ^ Command line arguments
+                              -> Handle
+                              -> Handle
+                              -> m ()
+sinkProcessStderrStdoutHandle wd menv name args err out = do
+  $logProcessRun name args
+  name' <- preProcess wd menv name
+  liftIO $ withCheckedProcess
+      (proc name' args)
+          { env = envHelper menv
+          , cwd = fmap toFilePath wd
+          , std_err = UseHandle err
+          , std_out = UseHandle out
+          }
+      (\ClosedStream UseProvidedHandle UseProvidedHandle -> return ())
 
 -- | Perform pre-call-process tasks.  Ensure the working directory exists and find the
 -- executable path.
 preProcess :: (MonadIO m)
-           => Maybe (Path Abs Dir) -- ^ Optional directory to create if necessary
-           -> EnvOverride
-           -> String -- ^ Command name
-           -> m FilePath
+  => Maybe (Path Abs Dir) -- ^ Optional directory to create if necessary
+  -> EnvOverride       -- ^ How to override environment
+  -> String            -- ^ Command name
+  -> m FilePath
 preProcess wd menv name = do
   name' <- liftIO $ liftM toFilePath $ join $ findExecutable menv name
-  maybe (return ()) createTree wd
+  maybe (return ()) ensureDir wd
   return name'
 
 -- | Check if the given executable exists on the given PATH.
-doesExecutableExist :: MonadIO m => EnvOverride -> String -> m Bool
+doesExecutableExist :: (MonadIO m)
+  => EnvOverride       -- ^ How to override environment
+  -> String            -- ^ Name of executable
+  -> m Bool
 doesExecutableExist menv name = liftM isJust $ findExecutable menv name
-
--- | Turn a relative path into an absolute path.
---
---   Note: this function duplicates the functionality of makeAbsolute
---   in recent versions of "System.Directory", and can be removed once
---   we no longer need to support older versions of GHC.
-makeAbsolute :: FilePath -> IO FilePath
-makeAbsolute = fmap FP.normalise . absolutize
-  where absolutize path
-          | FP.isRelative path = fmap (FP.</> path) getCurrentDirectory
-          | otherwise          = return path
 
 -- | Find the complete path for the executable.
 --
 -- Throws a 'ReadProcessException' if unsuccessful.
-findExecutable :: (MonadIO m, MonadThrow n) => EnvOverride -> String -> m (n (Path Abs File))
-findExecutable _ name | any FP.isPathSeparator name = do
-    exists <- liftIO $ doesFileExist name
-    if exists
-        then do
-            path <- liftIO $ parseRelAsAbsFile name
-            return $ return path
-        else return $ throwM $ ExecutableNotFoundAt name
+findExecutable :: (MonadIO m, MonadThrow n)
+  => EnvOverride       -- ^ How to override environment
+  -> String            -- ^ Name of executable
+  -> m (n (Path Abs File)) -- ^ Full path to that executable on success
+findExecutable eo name0 | any FP.isPathSeparator name0 = do
+    let names0
+            | null (eoExeExtension eo) = [name0]
+            -- Support `stack exec foo/bar.exe` on Windows
+            | otherwise = [name0 ++ eoExeExtension eo, name0]
+        testNames [] = return $ throwM $ ExecutableNotFoundAt name0
+        testNames (name:names) = do
+            exists <- liftIO $ D.doesFileExist name
+            if exists
+                then do
+                    path <- liftIO $ resolveFile' name
+                    return $ return path
+                else testNames names
+    testNames names0
 findExecutable eo name = liftIO $ do
     m <- readIORef $ eoExeCache eo
     epath <- case Map.lookup name m of
@@ -334,15 +349,15 @@ findExecutable eo name = liftIO $ do
                             | otherwise = [fp0 ++ eoExeExtension eo, fp0]
                         testFPs [] = loop dirs
                         testFPs (fp:fps) = do
-                            exists <- doesFileExist fp
+                            exists <- D.doesFileExist fp
                             if exists
                                 then do
-                                    fp' <- makeAbsolute fp >>= parseAbsFile
+                                    fp' <- D.makeAbsolute fp >>= parseAbsFile
                                     return $ return fp'
                                 else testFPs fps
                     testFPs fps0
             epath <- loop $ eoPath eo
-            !() <- atomicModifyIORef (eoExeCache eo) $ \m' ->
+            () <- atomicModifyIORef (eoExeCache eo) $ \m' ->
                 (Map.insert name epath m', ())
             return epath
     return $ either throwM return epath
@@ -355,17 +370,32 @@ getEnvOverride platform =
           mkEnvOverride platform
         . Map.fromList . map (T.pack *** T.pack)
 
+data PathException = PathsInvalidInPath [FilePath]
+    deriving Typeable
+
+instance Exception PathException
+instance Show PathException where
+    show (PathsInvalidInPath paths) = unlines $
+        [ "Would need to add some paths to the PATH environment variable \
+          \to continue, but they would be invalid because they contain a "
+          ++ show FP.searchPathSeparator ++ "."
+        , "Please fix the following paths and try again:"
+        ] ++ paths
+
 -- | Augment the PATH environment variable with the given extra paths.
-augmentPath :: [FilePath] -> Maybe Text -> Text
+augmentPath :: MonadThrow m => [FilePath] -> Maybe Text -> m Text
 augmentPath dirs mpath =
-    T.intercalate (T.singleton FP.searchPathSeparator)
-    $ map (T.pack . FP.dropTrailingPathSeparator) dirs
-   ++ maybe [] return mpath
+  do let illegal = filter (FP.searchPathSeparator `elem`) dirs
+     unless (null illegal) (throwM $ PathsInvalidInPath illegal)
+     return $ T.intercalate (T.singleton FP.searchPathSeparator)
+            $ map (T.pack . FP.dropTrailingPathSeparator) dirs
+            ++ maybeToList mpath
 
 -- | Apply 'augmentPath' on the PATH value in the given Map.
-augmentPathMap :: [FilePath] -> Map Text Text -> Map Text Text
-augmentPathMap paths origEnv =
-    Map.insert "PATH" path origEnv
+augmentPathMap :: MonadThrow m => [FilePath] -> Map Text Text
+                               -> m (Map Text Text)
+augmentPathMap dirs origEnv =
+  do path <- augmentPath dirs mpath
+     return $ Map.insert "PATH" path origEnv
   where
     mpath = Map.lookup "PATH" origEnv
-    path = augmentPath paths mpath

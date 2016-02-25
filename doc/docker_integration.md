@@ -1,10 +1,10 @@
-Using Docker with Stack
+Docker integration
 ===============================================================================
 
 `stack` has support for automatically performing builds inside a Docker
 container, using volume mounts and user ID switching to make it mostly seamless.
 FP Complete provides images for use with stack that include GHC, tools, and
-optionally have all of the Stackage LTS packages pre-installed in in the global
+optionally have all of the Stackage LTS packages pre-installed in the global
 package database.
 
 The primary purpose for using stack/docker this way is for teams to ensure all
@@ -72,10 +72,10 @@ in the last seven days marked for removal.  You can add or remove the `R` in
 the left-most column to flag or unflag an image/container for removal.  When
 you save the file and quit the text editor, those images marked for removal
 will be deleted from your system.  If you wish to abort the cleanup, delete
-all all the lines from your editor.
+all the lines from your editor.
 
 If you use Docker for purposes other than stack, you may have other images on
-your system as well.  These will also appear in in a separate section, but they
+your system as well.  These will also appear in a separate section, but they
 will not be marked for removal by default.
 
 Run `stack docker cleanup --help` to see additional options to customize its
@@ -87,7 +87,7 @@ In order to preserve the contents of the in-container home directory between
 runs, a special "sandbox" directory is volume-mounted into the container. `stack
 docker reset` will reset that sandbox to its defaults.
 
-Note: this leaves of `~/.stack` (which is separately volume-mounted) alone.
+Note: `~/.stack` is separately volume-mounted, and is left alone during reset.
 
 Command-line options
 -------------------------------------------------------------------------------
@@ -116,7 +116,7 @@ otherwise noted.
       # the case.
       enable: true
 
-      # The name of the repository to pull the image from.  See the "reposities"
+      # The name of the repository to pull the image from.  See the "repositories"
       # section of this document for more information about available repositories.
       # If this includes a tag (e.g. "my/image:tag"), that tagged image will be
       # used.  Without a tag specified, the LTS version slug is added automatically.
@@ -234,6 +234,11 @@ FP Complete also builds custom variants of these images for their clients.
 These images can also be used directory with `docker run` and provide a complete
 Haskell build environment.
 
+In addition, most Docker images that contain the basics for running GHC can be
+used with Stack's Docker integration. For example, the
+[official Haskell image repository](https://hub.docker.com/_/haskell/) works.
+See [Custom images](#custom-images) for more details.
+
 Prerequisites
 -------------------------------------------------------------------------------
 
@@ -266,7 +271,7 @@ user. For example (from
     # Restart the Docker daemon.
     sudo service docker restart
 
-You will now need to log out and log in again for the the group addition
+You will now need to log out and log in again for the group addition
 to take effect.
 
 Note the above has security implications.  See [security](#security) for more.
@@ -276,7 +281,7 @@ Security
 
 Having `docker` usable as a non-root user is always a security risk, and will
 allow root access to your system. It is also possible to craft a `stack.yaml`
-that will run arbitrary commands in an arbirary docker container through that
+that will run arbitrary commands in an arbitrary docker container through that
 vector, thus a `stack.yaml` could cause stack to run arbitrary commands as root.
 While this is a risk, it is not really a greater risk than is posed by the
 docker permissions in the first place (for example, if you ever run an unknown
@@ -315,12 +320,12 @@ Stackage snapshots.  In addition, `~/.stack` is volume-mounted from the host.
 
 ### Network
 
-stack containers use use the host's network stack within the container
+stack containers use the host's network stack within the container
 by default, meaning a process running in the container can connect to
 services running on the host, and a server process run within the container
 can be accessed from the host without needing to explicitly publish its port.
 To run the container with an isolated network, use `--docker-run-args` to pass
-a the `--net` argument to `docker-run`.  For example:
+the `--net` argument to `docker-run`.  For example:
 
     stack --docker-run-args='--net=bridge --publish=3000:3000' \
           exec some-server
@@ -333,7 +338,7 @@ and publish port 3000.
 If you do want to do all your work, including editing, in the container, it
 might be better to use a persistent container in which you can install Ubuntu
 packages. You could get that by running something like `stack
---docker-container-name=NAME --docker-persist docker exec bash`. This
+--docker-container-name=NAME --docker-persist exec --plain bash`. This
 means when the container exits, it won't be deleted. You can then restart it
 using `docker start -a -i NAME`. It's also possible to detach from a container
 while it continues running in the background using by pressing Ctrl-P Ctrl-Q,
@@ -352,7 +357,7 @@ is an example (replace `custom` if you prefer a different name for your derived
 container):
 
     # On host
-    $ stack  --docker-persist --docker-container-name=temp docker exec bash
+    $ stack  --docker-persist --docker-container-name=temp exec --plain bash
 
     # In container, make changes to OS
     $ sudo apt-get install r-cran-numderiv
@@ -373,6 +378,23 @@ Note, however, that any time a new image is used, you will have to re-do this
 process. You could also use a Dockerfile to make this reusable. Consult the
 [Docker user guide](https://docs.docker.com/userguide/) for more
 on creating Docker images.
+
+### Custom images
+
+The easiest way to create your own custom image us by extending FP Complete's
+images, but if you prefer to start from scratch, most images that include the
+basics for building code with GHC will work. The image doesn't even, strictly
+speaking, need to include GHC, but it does need to have libraries and tools that
+GHC requires (e.g., libgmp, gcc, etc.).
+
+There are also a few ways to set up images that tightens the integration:
+
+* Create a user and group named `stack`, and create a `~/.stack` directory for
+  it. Any build plans and caches from it will be copied from the image by Stack,
+  meaning they don't need to be downloaded separately.
+* Any packages in GHC's global package database will be available. This can be
+  used to add private libraries to the image, or the make available a set of
+  packages from an LTS release.
 
 Troubleshooting
 -------------------------------------------------------------------------------

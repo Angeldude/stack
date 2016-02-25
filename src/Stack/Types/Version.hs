@@ -24,6 +24,7 @@ module Stack.Types.Version
   ,withinRange
   ,Stack.Types.Version.intersectVersionRanges
   ,toMajorVersion
+  ,latestApplicableVersion
   ,checkVersion
   ,nextMajorVersion)
   where
@@ -32,17 +33,19 @@ import           Control.Applicative
 import           Control.DeepSeq
 import           Control.Monad.Catch
 import           Data.Aeson.Extended
-import           Data.Attoparsec.ByteString.Char8
+import           Data.Attoparsec.Text
 import           Data.Binary.VersionTagged (Binary, HasStructuralInfo)
-import           Data.ByteString (ByteString)
-import qualified Data.ByteString.Char8 as S8
 import           Data.Data
 import           Data.Hashable
 import           Data.List
 import           Data.Map (Map)
 import qualified Data.Map as Map
+import           Data.Maybe (listToMaybe)
+import           Data.Set (Set)
+import qualified Data.Set as Set
 import           Data.Text (Text)
 import qualified Data.Text as T
+import           Data.Text.Binary ()
 import           Data.Vector.Binary ()
 import           Data.Vector.Unboxed (Vector)
 import qualified Data.Vector.Unboxed as V
@@ -57,7 +60,7 @@ import           Text.PrettyPrint (render)
 
 -- | A parse fail.
 data VersionParseFail =
-  VersionParseFail ByteString
+  VersionParseFail Text
   deriving (Typeable)
 instance Exception VersionParseFail
 instance Show VersionParseFail where
@@ -102,7 +105,7 @@ instance FromJSON a => FromJSON (Map Version a) where
             k' <- either (fail . show) return $ parseVersionFromString k
             return (k', v)
 
--- | Attoparsec parser for a package version from bytestring.
+-- | Attoparsec parser for a package version.
 versionParser :: Parser Version
 versionParser =
   do ls <- ((:) <$> num <*> many num')
@@ -112,8 +115,8 @@ versionParser =
         num' = point *> num
         point = satisfy (== '.')
 
--- | Convenient way to parse a package version from a bytestring.
-parseVersion :: MonadThrow m => ByteString -> m Version
+-- | Convenient way to parse a package version from a 'Text'.
+parseVersion :: MonadThrow m => Text -> m Version
 parseVersion x = go x
   where go =
           either (const (throwM (VersionParseFail x))) return .
@@ -122,7 +125,7 @@ parseVersion x = go x
 -- | Migration function.
 parseVersionFromString :: MonadThrow m => String -> m Version
 parseVersionFromString =
-  parseVersion . S8.pack
+  parseVersion . T.pack
 
 -- | Get a string representation of a package version.
 versionString :: Version -> String
@@ -175,6 +178,11 @@ toMajorVersion  (Version v) =
         0 -> Version (V.fromList [0,        0])
         1 -> Version (V.fromList [V.head v, 0])
         _ -> Version (V.fromList [V.head v, v V.! 1])
+
+-- | Given a version range and a set of versions, find the latest version from
+-- the set that is within the range.
+latestApplicableVersion :: Cabal.VersionRange -> Set Version -> Maybe Version
+latestApplicableVersion r = listToMaybe . filter (`withinRange` r) . Set.toDescList
 
 -- | Get the next major version number for the given version
 nextMajorVersion :: Version -> Version

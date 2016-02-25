@@ -3,6 +3,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE PackageImports        #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -15,8 +16,10 @@ module Stack.Setup
   ( setupEnv
   , ensureCompiler
   , ensureDockerStackExe
+  , getSystemCompiler
   , SetupOpts (..)
   , defaultStackSetupYaml
+  , removeHaskellEnvVars
   ) where
 
 import           Control.Applicative
@@ -28,7 +31,7 @@ import           Control.Monad.Logger
 import           Control.Monad.Reader (MonadReader, ReaderT (..), asks)
 import           Control.Monad.State (get, put, modify)
 import           Control.Monad.Trans.Control
-import           Crypto.Hash (SHA1(SHA1))
+import "cryptohash" Crypto.Hash (SHA1(SHA1))
 import           Data.Aeson.Extended
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Char8 as S8
@@ -60,12 +63,13 @@ import qualified Data.Yaml as Yaml
 import           Distribution.System (OS, Arch (..), Platform (..))
 import qualified Distribution.System as Cabal
 import           Distribution.Text (simpleParse)
+import           Lens.Micro (set)
 import           Language.Haskell.TH as TH
 import           Network.HTTP.Client.Conduit
 import           Network.HTTP.Download.Verified
 import           Path
 import           Path.Extra (toFilePathNoTrailingSep)
-import           Path.IO
+import           Path.IO hiding (findExecutable)
 import qualified Paths_stack as Meta
 import           Prelude hiding (concat, elem, any) -- Fix AMP warning
 import           Safe (readMay)
@@ -77,7 +81,7 @@ import           Stack.Fetch
 import           Stack.GhcPkg (createDatabase, getCabalPkgVer, getGlobalDB, mkGhcPackagePath)
 import           Stack.Setup.Installed
 import           Stack.Types
-import           Stack.Types.Internal (HasTerminal, HasReExec, HasLogLevel)
+import           Stack.Types.Internal (HasTerminal, HasReExec, HasLogLevel, envConfigBuildOpts, buildOptsInstallExes)
 import           Stack.Types.StackT
 import qualified System.Directory as D
 import           System.Environment (getExecutablePath)
@@ -86,7 +90,7 @@ import           System.FilePath (searchPathSeparator)
 import qualified System.FilePath as FP
 import           System.Process (rawSystem)
 import           System.Process.Read
-import           System.Process.Run (runIn)
+import           System.Process.Run (runCmd, Cmd(..))
 import           Text.Printf (printf)
 
 -- | Default location of the stack-setup.yaml file
@@ -113,7 +117,7 @@ data SetupOpts = SetupOpts
     -- version. Only works reliably with a stack-managed installation.
     , soptsResolveMissingGHC :: !(Maybe Text)
     -- ^ Message shown to user for how to resolve the missing GHC
-    , soptsStackSetupYaml :: !String
+    , soptsStackSetupYaml :: !FilePath
     -- ^ Location of the main stack-setup.yaml file
     , soptsGHCBindistURL :: !(Maybe String)
     -- ^ Alternate GHC binary distribution (requires custom GHCVariant)
@@ -155,7 +159,7 @@ instance Show SetupException where
         [ "The GHC located at "
         , toFilePath ghc
         , " failed to compile a sanity check. Please see:\n\n"
-        , "    https://github.com/commercialhaskell/stack/blob/release/doc/install_and_upgrade.md\n\n"
+        , "    http://docs.haskellstack.org/en/stable/install_and_upgrade/\n\n"
         , "for more information. Exception was:\n"
         , show e
         ]
@@ -210,9 +214,8 @@ setupEnv mResolveMissingGHC = do
     -- Modify the initial environment to include the GHC path, if a local GHC
     -- is being used
     menv0 <- getMinimalEnvOverride
-    let env = removeHaskellEnvVars
-            $ augmentPathMap (maybe [] edBins mghcBin)
-            $ unEnvOverride menv0
+    env <- removeHaskellEnvVars
+             <$> augmentPathMap (maybe [] edBins mghcBin) (unEnvOverride menv0)
 
     menv <- mkEnvOverride platform env
     compilerVer <- getCompilerVersion menv wc
@@ -231,8 +234,8 @@ setupEnv mResolveMissingGHC = do
     mkDirs <- runReaderT extraBinDirs envConfig0
     let mpath = Map.lookup "PATH" env
         mkDirs' = map toFilePath . mkDirs
-        depsPath = augmentPath (mkDirs' False) mpath
-        localsPath = augmentPath (mkDirs' True) mpath
+    depsPath <- augmentPath (mkDirs' False) mpath
+    localsPath <- augmentPath (mkDirs' True) mpath
 
     deps <- runReaderT packageDatabaseDeps envConfig0
     createDatabase menv wc deps
@@ -246,7 +249,7 @@ setupEnv mResolveMissingGHC = do
 
     executablePath <- liftIO getExecutablePath
 
-    utf8EnvVars <- getUtf8LocaleVars menv
+    utf8EnvVars <- getUtf8EnvVars menv compilerVer
 
     envRef <- liftIO $ newIORef Map.empty
     let getEnvOverride' es = do
@@ -416,7 +419,7 @@ ensureCompiler sopts = do
             Nothing -> return menv0
             Just ed -> do
                 config <- asks getConfig
-                let m = augmentPathMap (edBins ed) (unEnvOverride menv0)
+                m <- augmentPathMap (edBins ed) (unEnvOverride menv0)
                 mkEnvOverride (configPlatform config) (removeHaskellEnvVars m)
 
     when (soptsUpgradeCabal sopts) $ do
@@ -439,12 +442,12 @@ ensureDockerStackExe
     => Platform -> m (Path Abs File)
 ensureDockerStackExe containerPlatform = do
     config <- asks getConfig
-    containerPlatformDir <- runReaderT platformOnlyRelDir containerPlatform
+    containerPlatformDir <- runReaderT platformOnlyRelDir (containerPlatform,PlatformVariantNone)
     let programsPath = configLocalProgramsBase config </> containerPlatformDir
         stackVersion = fromCabalVersion Meta.version
         tool = Tool (PackageIdentifier $(mkPackageName "stack") stackVersion)
     stackExePath <- (</> $(mkRelFile "stack")) <$> installDir programsPath tool
-    stackExeExists <- fileExists stackExePath
+    stackExeExists <- doesFileExist stackExePath
     unless stackExeExists $
         do
            $logInfo $ mconcat ["Downloading Docker-compatible ", T.pack stackProgName, " executable"]
@@ -490,7 +493,7 @@ upgradeCabal menv wc = do
             , T.pack $ versionString newest
             , ". I'm not upgrading Cabal."
             ]
-        else withCanonicalizedSystemTempDirectory "stack-cabal-upgrade" $ \tmpdir -> do
+        else withSystemTempDir "stack-cabal-upgrade" $ \tmpdir -> do
             $logInfo $ T.concat
                 [ "Installing Cabal-"
                 , T.pack $ versionString newest
@@ -511,7 +514,7 @@ upgradeCabal menv wc = do
                     Nothing -> error "upgradeCabal: Invariant violated, dir missing"
                     Just dir -> return dir
 
-            runIn dir (compilerExeName wc) menv ["Setup.hs"] Nothing
+            runCmd (Cmd (Just dir) (compilerExeName wc) menv ["Setup.hs"]) Nothing
             platform <- asks getPlatform
             let setupExe = toFilePath $ dir </>
                   (case platform of
@@ -523,13 +526,10 @@ upgradeCabal menv wc = do
                     , "dir="
                     , installRoot FP.</> name'
                     ]
-            runIn dir setupExe menv
-                ( "configure"
-                : map dirArgument (words "lib bin data doc")
-                )
-                Nothing
-            runIn dir setupExe menv ["build"] Nothing
-            runIn dir setupExe menv ["install"] Nothing
+                args = ( "configure": map dirArgument (words "lib bin data doc") )
+            runCmd (Cmd (Just dir) setupExe menv args) Nothing
+            runCmd (Cmd (Just dir) setupExe menv ["build"]) Nothing
+            runCmd (Cmd (Just dir) setupExe menv ["install"]) Nothing
             $logInfo "New Cabal library installed"
 
 -- | Get the version of the system compiler, if available
@@ -544,9 +544,9 @@ getSystemCompiler menv wc = do
             eres <- tryProcessStdout Nothing menv exeName ["--info"]
             let minfo = do
                     Right bs <- Just eres
-                    pairs <- readMay $ S8.unpack bs :: Maybe [(String, String)]
-                    version <- lookup "Project version" pairs >>= parseVersionFromString
-                    arch <- lookup "Target platform" pairs >>= simpleParse . takeWhile (/= '-')
+                    pairs_ <- readMay $ S8.unpack bs :: Maybe [(String, String)]
+                    version <- lookup "Project version" pairs_ >>= parseVersionFromString
+                    arch <- lookup "Target platform" pairs_ >>= simpleParse . takeWhile (/= '-')
                     return (version, arch)
             case (wc, minfo) of
                 (Ghc, Just (version, arch)) -> return (Just (GhcVersion version, arch))
@@ -655,7 +655,7 @@ downloadAndInstallCompiler si wanted@(GhcVersion{}) versionCheck mbindistURL = d
             ghcKey <- getGhcKey
             case Map.lookup ghcKey $ siGHCs si of
                 Nothing -> throwM $ UnknownOSKey ghcKey
-                Just pairs -> getWantedCompilerInfo ghcKey versionCheck wanted GhcVersion pairs
+                Just pairs_ -> getWantedCompilerInfo ghcKey versionCheck wanted GhcVersion pairs_
     config <- asks getConfig
     let installer =
             case configPlatform config of
@@ -679,14 +679,11 @@ downloadAndInstallCompiler si wanted versionCheck _mbindistUrl = do
         _ -> throwM GHCJSRequiresStandardVariant
     (selectedVersion, downloadInfo) <- case Map.lookup "source" $ siGHCJSs si of
         Nothing -> throwM $ UnknownOSKey "source"
-        Just pairs -> getWantedCompilerInfo "source" versionCheck wanted id pairs
+        Just pairs_ -> getWantedCompilerInfo "source" versionCheck wanted id pairs_
     $logInfo "Preparing to install GHCJS to an isolated location."
     $logInfo "This will not interfere with any system-level installation."
     let tool = ToolGhcjs selectedVersion
-        installer = installGHCJS $ case selectedVersion of
-            GhcjsVersion version _ -> version
-            _ -> error "Invariant violated: expected ghcjs version in downloadAndInstallCompiler."
-    downloadAndInstallTool (configLocalPrograms config) si downloadInfo tool installer
+    downloadAndInstallTool (configLocalPrograms config) si downloadInfo tool installGHCJS
 
 getWantedCompilerInfo :: (Ord k, MonadThrow m)
                       => Text
@@ -695,15 +692,15 @@ getWantedCompilerInfo :: (Ord k, MonadThrow m)
                       -> (k -> CompilerVersion)
                       -> Map k a
                       -> m (k, a)
-getWantedCompilerInfo key versionCheck wanted toCV pairs =
+getWantedCompilerInfo key versionCheck wanted toCV pairs_ =
     case mpair of
         Just pair -> return pair
-        Nothing -> throwM $ UnknownCompilerVersion key wanted (map toCV (Map.keys pairs))
+        Nothing -> throwM $ UnknownCompilerVersion key wanted (map toCV (Map.keys pairs_))
   where
     mpair =
         listToMaybe $
         sortBy (flip (comparing fst)) $
-        filter (isWantedCompiler versionCheck wanted . toCV . fst) (Map.toList pairs)
+        filter (isWantedCompiler versionCheck wanted . toCV . fst) (Map.toList pairs_)
 
 getGhcKey :: (MonadReader env m, MonadThrow m, HasPlatform env, HasGHCVariant env, MonadLogger m, MonadIO m, MonadCatch m, MonadBaseControl IO m)
           => m Text
@@ -788,9 +785,9 @@ installGHCPosix version _ archiveFile archiveType destDir = do
     $logDebug $ "make: " <> T.pack makeTool
     $logDebug $ "tar: " <> T.pack tarTool
 
-    withCanonicalizedSystemTempDirectory "stack-setup" $ \root -> do
+    withSystemTempDir "stack-setup" $ \root -> do
         dir <-
-            liftM (root Path.</>) $
+            liftM (root </>) $
             parseRelDir $
             "ghc-" ++ versionString version
 
@@ -799,7 +796,7 @@ installGHCPosix version _ archiveFile archiveType destDir = do
         readInNull root tarTool menv ["xf", toFilePath archiveFile] Nothing
 
         $logSticky "Configuring GHC ..."
-        readInNull dir (toFilePath $ dir Path.</> $(mkRelFile "configure"))
+        readInNull dir (toFilePath $ dir </> $(mkRelFile "configure"))
                    menv ["--prefix=" ++ toFilePath destDir] Nothing
 
         $logSticky "Installing GHC ..."
@@ -809,13 +806,12 @@ installGHCPosix version _ archiveFile archiveType destDir = do
         $logDebug $ "GHC installed to " <> T.pack (toFilePath destDir)
 
 installGHCJS :: (MonadIO m, MonadMask m, MonadLogger m, MonadReader env m, HasConfig env, HasHttpManager env, HasTerminal env, HasReExec env, HasLogLevel env, MonadBaseControl IO m)
-             => Version
-             -> SetupInfo
+             => SetupInfo
              -> Path Abs File
              -> ArchiveType
              -> Path Abs Dir
              -> m ()
-installGHCJS version si archiveFile archiveType destDir = do
+installGHCJS si archiveFile archiveType destDir = do
     platform <- asks getPlatform
     menv0 <- getMinimalEnvOverride
     -- This ensures that locking is disabled for the invocations of
@@ -835,11 +831,10 @@ installGHCJS version si archiveFile archiveType destDir = do
     -- environment of the stack.yaml which came with ghcjs, in order to
     -- install cabal-install. This lets us also fix the version of
     -- cabal-install used.
-    let unpackDir = destDir Path.</> $(mkRelDir "src")
-    tarComponent <- parseRelDir ("ghcjs-" ++ versionString version)
+    let unpackDir = destDir </> $(mkRelDir "src")
     runUnpack <- case platform of
         Platform _ Cabal.Windows -> return $
-            withUnpackedTarball7z "GHCJS" si archiveFile archiveType tarComponent unpackDir
+            withUnpackedTarball7z "GHCJS" si archiveFile archiveType Nothing unpackDir
         _ -> do
             zipTool' <-
                 case archiveType of
@@ -853,9 +848,10 @@ installGHCJS version si archiveFile archiveType destDir = do
             $logDebug $ "ziptool: " <> T.pack zipTool
             $logDebug $ "tar: " <> T.pack tarTool
             return $ do
-                removeTreeIfExists unpackDir
+                ignoringAbsence (removeDirRecur unpackDir)
                 readInNull destDir tarTool menv ["xf", toFilePath archiveFile] Nothing
-                renameDir (destDir Path.</> tarComponent) unpackDir
+                innerDir <- expectSingleUnpackedDir archiveFile destDir
+                renameDir innerDir unpackDir
 
     $logSticky $ T.concat ["Unpacking GHCJS into ", T.pack . toFilePath $ unpackDir, " ..."]
     $logDebug $ "Unpacking " <> T.pack (toFilePath archiveFile)
@@ -863,27 +859,27 @@ installGHCJS version si archiveFile archiveType destDir = do
 
     $logSticky "Setting up GHCJS build environment"
     let stackYaml = unpackDir </> $(mkRelFile "stack.yaml")
-        destBinDir = destDir Path.</> $(mkRelDir "bin")
-    createTree destBinDir
-    envConfig <- loadGhcjsEnvConfig stackYaml destBinDir
+        destBinDir = destDir </> $(mkRelDir "bin")
+    ensureDir destBinDir
+    envConfig' <- loadGhcjsEnvConfig stackYaml destBinDir
 
     -- On windows we need to copy options files out of the install dir.  Argh!
     -- This is done before the build, so that if it fails, things fail
     -- earlier.
     mwindowsInstallDir <- case platform of
         Platform _ Cabal.Windows ->
-            liftM Just $ runInnerStackT envConfig installationRootLocal
+            liftM Just $ runInnerStackT envConfig' installationRootLocal
         _ -> return Nothing
 
     $logSticky "Installing GHCJS (this will take a long time) ..."
-    runInnerStackT envConfig $
-        build (\_ -> return ()) Nothing defaultBuildOpts { boptsInstallExes = True }
+    runInnerStackT ((set (envConfigBuildOpts.buildOptsInstallExes) True envConfig')) $
+        (build (\_ -> return ()) Nothing defaultBuildOptsCLI)
     -- Copy over *.options files needed on windows.
     forM_ mwindowsInstallDir $ \dir -> do
-        (_, files) <- listDirectory (dir </> $(mkRelDir "bin"))
+        (_, files) <- listDir (dir </> $(mkRelDir "bin"))
         forM_ (filter ((".options" `isSuffixOf`). toFilePath) files) $ \optionsFile -> do
             let dest = destDir </> $(mkRelDir "bin") </> filename optionsFile
-            removeFileIfExists dest
+            ignoringAbsence (removeFile dest)
             copyFile optionsFile dest
     $logStickyDone "Installed GHCJS."
 
@@ -900,7 +896,7 @@ installDockerStackExe _ archiveFile _ destDir = do
         checkDependencies $
         (,) <$> checkDependency "gzip" <*> checkDependency "tar"
     menv <- getMinimalEnvOverride
-    createTree destDir
+    ensureDir destDir
     readInNull
         destDir
         tarTool
@@ -929,14 +925,14 @@ ensureGhcjsBooted menv cv shouldBoot  = do
                 -- https://github.com/commercialhaskell/stack/issues/749#issuecomment-147382783
                 -- This only affects the case where GHCJS has been
                 -- installed with an older version and not yet booted.
-                stackYamlExists <- fileExists stackYaml
+                stackYamlExists <- doesFileExist stackYaml
                 actualStackYaml <- if stackYamlExists then return stackYaml
                     else case cv of
                         GhcjsVersion version _ ->
-                            liftM ((destDir Path.</> $(mkRelDir "src")) Path.</>) $
+                            liftM ((destDir </> $(mkRelDir "src")) </>) $
                             parseRelFile $ "ghcjs-" ++ versionString version ++ "/stack.yaml"
                         _ -> fail "ensureGhcjsBooted invoked on non GhcjsVersion"
-                actualStackYamlExists <- fileExists actualStackYaml
+                actualStackYamlExists <- doesFileExist actualStackYaml
                 unless actualStackYamlExists $
                     fail "Couldn't find GHCJS stack.yaml in old or new location."
                 bootGhcjs actualStackYaml destDir
@@ -966,7 +962,7 @@ bootGhcjs stackYaml destDir = do
         runInnerStackT envConfig $
             build (\_ -> return ())
                   Nothing
-                  defaultBuildOpts { boptsTargets = ["cabal-install"] }
+                  defaultBuildOptsCLI { boptsCLITargets = ["cabal-install"] }
     $logSticky "Booting GHCJS (this will take a long time) ..."
     let envSettings = defaultEnvSettings { esIncludeGhcPackagePath = False }
     menv' <- liftIO $ configEnvOverride (getConfig envConfig) envSettings
@@ -990,7 +986,8 @@ loadGhcjsEnvConfig stackYaml binPath = runInnerStackLoggingT $ do
             , configMonoidLocalBinPath = Just (toFilePath binPath)
             })
         (Just stackYaml)
-    bconfig <- lcLoadBuildConfig lc Nothing Nothing
+        Nothing
+    bconfig <- lcLoadBuildConfig lc Nothing
     runInnerStackT bconfig $ setupEnv Nothing
 
 getCabalInstallVersion :: (MonadIO m, MonadBaseControl IO m, MonadLogger m, MonadCatch m)
@@ -999,7 +996,7 @@ getCabalInstallVersion menv = do
     ebs <- tryProcessStdout Nothing menv "cabal" ["--numeric-version"]
     case ebs of
         Left _ -> return Nothing
-        Right bs -> Just <$> parseVersion (T.encodeUtf8 (T.dropWhileEnd isSpace (T.decodeUtf8 bs)))
+        Right bs -> Just <$> parseVersion (T.dropWhileEnd isSpace (T.decodeUtf8 bs))
 
 -- | Check if given processes appear to be present, throwing an exception if
 -- missing.
@@ -1044,7 +1041,7 @@ installGHCWindows :: (MonadIO m, MonadMask m, MonadLogger m, MonadReader env m, 
                   -> m ()
 installGHCWindows version si archiveFile archiveType destDir = do
     tarComponent <- parseRelDir $ "ghc-" ++ versionString version
-    withUnpackedTarball7z "GHC" si archiveFile archiveType tarComponent destDir
+    withUnpackedTarball7z "GHC" si archiveFile archiveType (Just tarComponent) destDir
     $logInfo $ "GHC installed to " <> T.pack (toFilePath destDir)
 
 installMsys2Windows :: (MonadIO m, MonadMask m, MonadLogger m, MonadReader env m, HasConfig env, HasHttpManager env, MonadBaseControl IO m)
@@ -1063,27 +1060,26 @@ installMsys2Windows osKey si archiveFile archiveType destDir = do
         throwM e
 
     msys <- parseRelDir $ "msys" ++ T.unpack (fromMaybe "32" $ T.stripPrefix "windows" osKey)
-    withUnpackedTarball7z "MSYS2" si archiveFile archiveType msys destDir
+    withUnpackedTarball7z "MSYS2" si archiveFile archiveType (Just msys) destDir
 
     platform <- asks getPlatform
     menv0 <- getMinimalEnvOverride
-    let oldEnv = unEnvOverride menv0
-        newEnv = augmentPathMap
-            [toFilePath $ destDir </> $(mkRelDir "usr") </> $(mkRelDir "bin")]
-            oldEnv
+    newEnv <- augmentPathMap [toFilePath $ destDir </> $(mkRelDir "usr")
+                                                   </> $(mkRelDir "bin")]
+                             (unEnvOverride menv0)
     menv <- mkEnvOverride platform newEnv
 
     -- I couldn't find this officially documented anywhere, but you need to run
     -- the shell once in order to initialize some pacman stuff. Once that run
     -- happens, you can just run commands as usual.
-    runIn destDir "sh" menv ["--login", "-c", "true"] Nothing
+    runCmd (Cmd (Just destDir) "sh" menv ["--login", "-c", "true"]) Nothing
 
     -- No longer installing git, it's unreliable
     -- (https://github.com/commercialhaskell/stack/issues/1046) and the
     -- MSYS2-installed version has bad CRLF defaults.
     --
     -- Install git. We could install other useful things in the future too.
-    -- runIn destDir "pacman" menv ["-Sy", "--noconfirm", "git"] Nothing
+    -- runCmd (Cmd (Just destDir) "pacman" menv ["-Sy", "--noconfirm", "git"]) Nothing
 
 -- | Unpack a compressed tarball using 7zip.  Expects a single directory in
 -- the unpacked results, which is renamed to the destination directory.
@@ -1092,10 +1088,10 @@ withUnpackedTarball7z :: (MonadIO m, MonadMask m, MonadLogger m, MonadReader env
                       -> SetupInfo
                       -> Path Abs File -- ^ Path to archive file
                       -> ArchiveType
-                      -> Path Rel Dir -- ^ Name of directory expected to be in archive.
+                      -> Maybe (Path Rel Dir) -- ^ Name of directory expected in archive.  If Nothing, expects a single folder.
                       -> Path Abs Dir -- ^ Destination directory.
                       -> m ()
-withUnpackedTarball7z name si archiveFile archiveType srcDir destDir = do
+withUnpackedTarball7z name si archiveFile archiveType msrcDir destDir = do
     suffix <-
         case archiveType of
             TarXz -> return ".xz"
@@ -1108,12 +1104,14 @@ withUnpackedTarball7z name si archiveFile archiveType srcDir destDir = do
             Just x -> parseAbsFile $ T.unpack x
     run7z <- setup7z si
     let tmpName = toFilePathNoTrailingSep (dirname destDir) ++ "-tmp"
-    createTree (parent destDir)
-    withCanonicalizedTempDirectory (toFilePath $ parent destDir) tmpName $ \tmpDir -> do
-        let absSrcDir = tmpDir </> srcDir
-        removeTreeIfExists destDir
+    ensureDir (parent destDir)
+    withTempDir (parent destDir) tmpName $ \tmpDir -> do
+        ignoringAbsence (removeDirRecur destDir)
         run7z (parent archiveFile) archiveFile
         run7z tmpDir tarFile
+        absSrcDir <- case msrcDir of
+            Just srcDir -> return $ tmpDir </> srcDir
+            Nothing -> expectSingleUnpackedDir archiveFile tmpDir
         removeFile tarFile `catchIO` \e ->
             $logWarn (T.concat
                 [ "Exception when removing "
@@ -1122,6 +1120,13 @@ withUnpackedTarball7z name si archiveFile archiveType srcDir destDir = do
                 , T.pack $ show e
                 ])
         renameDir absSrcDir destDir
+
+expectSingleUnpackedDir :: (MonadIO m, MonadThrow m) => Path Abs File -> Path Abs Dir -> m (Path Abs Dir)
+expectSingleUnpackedDir archiveFile destDir = do
+    contents <- listDir destDir
+    case contents of
+        ([dir], []) -> return dir
+        _ -> error $ "Expected a single directory within unpacked " ++ toFilePath archiveFile
 
 -- | Download 7z as necessary, and get a function for unpacking things.
 --
@@ -1273,13 +1278,12 @@ chunksOverTime diff = do
           else put (lastTime,    acc')
         go
 
-
 -- | Perform a basic sanity check of GHC
 sanityCheck :: (MonadIO m, MonadMask m, MonadLogger m, MonadBaseControl IO m)
             => EnvOverride
             -> WhichCompiler
             -> m ()
-sanityCheck menv wc = withCanonicalizedSystemTempDirectory "stack-sanity-check" $ \dir -> do
+sanityCheck menv wc = withSystemTempDir "stack-sanity-check" $ \dir -> do
     let fp = toFilePath $ dir </> $(mkRelFile "Main.hs")
     liftIO $ writeFile fp $ unlines
         [ "import Distribution.Simple" -- ensure Cabal library is present
@@ -1305,77 +1309,82 @@ removeHaskellEnvVars =
     Map.delete "HASKELL_PACKAGE_SANDBOXES" .
     Map.delete "HASKELL_DIST_DIR"
 
--- | Get map of environment variables to set to change the locale's encoding to UTF-8
-getUtf8LocaleVars
+-- | Get map of environment variables to set to change the GHC's encoding to UTF-8
+getUtf8EnvVars
     :: forall m env.
        (MonadReader env m, HasPlatform env, MonadLogger m, MonadCatch m, MonadBaseControl IO m, MonadIO m)
-    => EnvOverride -> m (Map Text Text)
-getUtf8LocaleVars menv = do
-    Platform _ os <- asks getPlatform
-    if os == Cabal.Windows
-        then
-             -- On Windows, locale is controlled by the code page, so we don't set any environment
-             -- variables.
-             return
-                 Map.empty
-        else do
-            let checkedVars = map checkVar (Map.toList $ eoTextMap menv)
-                -- List of environment variables that will need to be updated to set UTF-8 (because
-                -- they currently do not specify UTF-8).
-                needChangeVars = concatMap fst checkedVars
-                -- Set of locale-related environment variables that have already have a value.
-                existingVarNames = Set.unions (map snd checkedVars)
-                -- True if a locale is already specified by one of the "global" locale variables.
-                hasAnyExisting =
-                    any (`Set.member` existingVarNames) ["LANG", "LANGUAGE", "LC_ALL"]
-            if null needChangeVars && hasAnyExisting
-                then
-                     -- If no variables need changes and at least one "global" variable is set, no
-                     -- changes to environment need to be made.
-                     return
-                         Map.empty
-                else do
-                    -- Get a list of known locales by running @locale -a@.
-                    elocales <- tryProcessStdout Nothing menv "locale" ["-a"]
-                    let
-                        -- Filter the list to only include locales with UTF-8 encoding.
-                        utf8Locales =
-                            case elocales of
-                                Left _ -> []
-                                Right locales ->
-                                    filter
-                                        isUtf8Locale
-                                        (T.lines $
-                                         T.decodeUtf8With
-                                             T.lenientDecode
-                                             locales)
-                        mfallback = getFallbackLocale utf8Locales
-                    when
-                        (isNothing mfallback)
-                        ($logWarn
-                             "Warning: unable to set locale to UTF-8 encoding; GHC may fail with 'invalid character'")
-                    let
-                        -- Get the new values of variables to adjust.
-                        changes =
-                            Map.unions $
-                            map
-                                (adjustedVarValue utf8Locales mfallback)
-                                needChangeVars
-                        -- Get the values of variables to add.
-                        adds
-                          | hasAnyExisting =
-                              -- If we already have a "global" variable, then nothing needs
-                              -- to be added.
-                              Map.empty
-                          | otherwise =
-                              -- If we don't already have a "global" variable, then set LANG to the
-                              -- fallback.
-                              case mfallback of
-                                  Nothing -> Map.empty
-                                  Just fallback ->
-                                      Map.singleton "LANG" fallback
-                    return (Map.union changes adds)
+    => EnvOverride -> CompilerVersion -> m (Map Text Text)
+getUtf8EnvVars menv compilerVer = do
+    if getGhcVersion compilerVer >= $(mkVersion "7.10.3")
+        -- GHC_CHARENC supported by GHC >=7.10.3
+        then return $ Map.singleton "GHC_CHARENC" "UTF-8"
+        else legacyLocale
   where
+    legacyLocale = do
+        Platform _ os <- asks getPlatform
+        if os == Cabal.Windows
+            then
+                 -- On Windows, locale is controlled by the code page, so we don't set any environment
+                 -- variables.
+                 return
+                     Map.empty
+            else do
+                let checkedVars = map checkVar (Map.toList $ eoTextMap menv)
+                    -- List of environment variables that will need to be updated to set UTF-8 (because
+                    -- they currently do not specify UTF-8).
+                    needChangeVars = concatMap fst checkedVars
+                    -- Set of locale-related environment variables that have already have a value.
+                    existingVarNames = Set.unions (map snd checkedVars)
+                    -- True if a locale is already specified by one of the "global" locale variables.
+                    hasAnyExisting =
+                        any (`Set.member` existingVarNames) ["LANG", "LANGUAGE", "LC_ALL"]
+                if null needChangeVars && hasAnyExisting
+                    then
+                         -- If no variables need changes and at least one "global" variable is set, no
+                         -- changes to environment need to be made.
+                         return
+                             Map.empty
+                    else do
+                        -- Get a list of known locales by running @locale -a@.
+                        elocales <- tryProcessStdout Nothing menv "locale" ["-a"]
+                        let
+                            -- Filter the list to only include locales with UTF-8 encoding.
+                            utf8Locales =
+                                case elocales of
+                                    Left _ -> []
+                                    Right locales ->
+                                        filter
+                                            isUtf8Locale
+                                            (T.lines $
+                                             T.decodeUtf8With
+                                                 T.lenientDecode
+                                                 locales)
+                            mfallback = getFallbackLocale utf8Locales
+                        when
+                            (isNothing mfallback)
+                            ($logWarn
+                                 "Warning: unable to set locale to UTF-8 encoding; GHC may fail with 'invalid character'")
+                        let
+                            -- Get the new values of variables to adjust.
+                            changes =
+                                Map.unions $
+                                map
+                                    (adjustedVarValue utf8Locales mfallback)
+                                    needChangeVars
+                            -- Get the values of variables to add.
+                            adds
+                              | hasAnyExisting =
+                                  -- If we already have a "global" variable, then nothing needs
+                                  -- to be added.
+                                  Map.empty
+                              | otherwise =
+                                  -- If we don't already have a "global" variable, then set LANG to the
+                                  -- fallback.
+                                  case mfallback of
+                                      Nothing -> Map.empty
+                                      Just fallback ->
+                                          Map.singleton "LANG" fallback
+                        return (Map.union changes adds)
     -- Determines whether an environment variable is locale-related and, if so, whether it needs to
     -- be adjusted.
     checkVar

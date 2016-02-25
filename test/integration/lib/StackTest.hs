@@ -8,6 +8,7 @@ import System.Directory
 import System.IO
 import System.Process
 import System.Exit
+import System.Info (os)
 
 run' :: FilePath -> [String] -> IO ExitCode
 run' cmd args = do
@@ -40,6 +41,18 @@ stackErr args = do
     if ec == ExitSuccess
         then error "stack was supposed to fail, but didn't"
         else return ()
+
+-- | Run stack with arguments and apply a check to the resulting
+-- stderr output if the process succeeded.
+stackCheckStderr :: [String] -> (String -> IO ()) -> IO ()
+stackCheckStderr args check = do
+    stack <- getEnv "STACK_EXE"
+    logInfo $ "Running: " ++ stack ++ " " ++ intercalate " " (map showProcessArgDebug args)
+    (ec, _, err) <- readProcessWithExitCode stack args ""
+    hPutStr stderr err
+    if ec /= ExitSuccess
+        then error $ "Exited with exit code: " ++ show ec
+        else check err
 
 doesNotExist :: FilePath -> IO ()
 doesNotExist fp = do
@@ -102,3 +115,15 @@ showProcessArgDebug x
   where special '"' = True
         special ' ' = True
         special _ = False
+
+-- | Extension of executables
+exeExt = if isWindows then ".exe" else ""
+
+-- | Is the OS Windows?
+isWindows = os == "mingw32"
+
+-- | To avoid problems with GHC version mismatch when a new LTS major
+-- version is released, pass this argument to @stack@ when running in
+-- a global context.  The LTS major version here should match that of
+-- the main @stack.yaml@.
+defaultResolverArg = "--resolver=lts-4"

@@ -58,7 +58,9 @@ main =
                 gArch = arch
                 gBinarySuffix = ""
                 gUploadLabel = Nothing
+                gTestHaddocks = True
                 gProjectRoot = "" -- Set to real value velow.
+                gBuildArgs = []
                 global0 = foldl (flip id) Global{..} flags
             -- Need to get paths after options since the '--arch' argument can effect them.
             projectRoot' <- getStackPath global0 "project-root"
@@ -98,7 +100,15 @@ options =
         "Extra suffix to add to binary executable archive filename."
     , Option "" [uploadLabelOptName]
         (ReqArg (\v -> Right $ \g -> g{gUploadLabel = Just v}) "LABEL")
-        "Label to give the uploaded release asset" ]
+        "Label to give the uploaded release asset"
+    , Option "" [noTestHaddocksOptName] (NoArg $ Right $ \g -> g{gTestHaddocks = False})
+        "Disable testing building haddocks."
+    , Option "" [buildArgsOptName]
+        (ReqArg
+            (\v -> Right $ \g -> g{gBuildArgs = words v})
+            "\"ARG1 ARG2 ...\"")
+        "Additional arguments to pass to 'stack build'."
+    ]
 
 -- | Shake rules.
 rules :: Global -> [String] -> Rules ()
@@ -127,8 +137,6 @@ rules global@Global{..} args = do
     distroPhonies debianDistro debianVersions debPackageFileName
     distroPhonies centosDistro centosVersions rpmPackageFileName
     distroPhonies fedoraDistro fedoraVersions rpmPackageFileName
-    phony archUploadPhony $ need [archDir </> archPackageFileName <.> uploadExt]
-    phony archBuildPhony $ need [archDir </> archPackageFileName]
 
     releaseDir </> "*" <.> uploadExt %> \out -> do
         let srcFile = dropExtension out
@@ -147,12 +155,12 @@ rules global@Global{..} args = do
         withTempDir $ \tmpDir -> do
             let cmd0 = cmd (releaseBinDir </> binaryName </> stackExeFileName)
                     (stackArgs global)
+                    gBuildArgs
                     ["--local-bin-path=" ++ tmpDir]
-            () <- cmd0 "install --pedantic --haddock --no-haddock-deps"
-            () <- cmd0 "install cabal-install"
-            let cmd' = cmd (AddPath [tmpDir] []) stackProgName (stackArgs global)
-            () <- cmd' "clean"
-            () <- cmd' "build --pedantic"
+            () <- cmd0 $ concat $ concat
+                [["install --pedantic --no-haddock-deps"], [" --haddock" | gTestHaddocks]]
+            () <- cmd0 "install --resolver=lts-4.0 cabal-install"
+            let cmd' = cmd (AddPath [tmpDir] []) stackProgName (stackArgs global) gBuildArgs
             () <- cmd' "test --pedantic --flag stack:integration-tests"
             return ()
         copyFileChanged (releaseBinDir </> binaryName </> stackExeFileName) out
@@ -222,6 +230,7 @@ rules global@Global{..} args = do
         actionOnException
             (cmd stackProgName
                 (stackArgs global)
+                gBuildArgs
                 ["--local-bin-path=" ++ takeDirectory out]
                  "install --pedantic")
             (removeFile out)
@@ -231,30 +240,6 @@ rules global@Global{..} args = do
     rpmDistroRules centosDistro centosVersions
     rpmDistroRules fedoraDistro fedoraVersions
 
-    archDir </> archPackageFileName <.> uploadExt %> \out -> do
-       let pkgFile = dropExtension out
-       need [pkgFile]
-       () <- cmd "aws s3 cp"
-           [ pkgFile
-           , "s3://download.fpcomplete.com/archlinux/" ++ takeFileName pkgFile ]
-       copyFileChanged pkgFile out
-    archDir </> archPackageFileName %> \out -> do
-        docFiles <- getDocFiles
-        let inputFiles = concat
-                [[archStagedExeFile
-                 ,archStagedBashCompletionFile]
-                ,map (archStagedDocDir </>) docFiles]
-        need inputFiles
-        putNormal $ "tar gzip " ++ out
-        writeTarGz out archStagingDir inputFiles
-    archStagedExeFile %> \out -> do
-        copyFileChanged (releaseDir </> binaryExeFileName) out
-    archStagedBashCompletionFile %> \out -> do
-        writeBashCompletion archStagedExeFile archStagingDir out
-    archStagedDocDir ++ "//*" %> \out -> do
-        let origFile = dropDirectoryPrefix archStagedDocDir out
-        copyFileChanged origFile out
-
   where
 
     debDistroRules debDistro0 debVersions = do
@@ -263,7 +248,14 @@ rules global@Global{..} args = do
            let DistroVersion{..} = distroVersionFromPath out debVersions
                pkgFile = dropExtension out
            need [pkgFile]
-           () <- cmd "deb-s3 upload -b download.fpcomplete.com --preserve-versions"
+           () <- cmd "deb-s3 upload --preserve-versions --bucket download.fpcomplete.com"
+               [ "--sign=" ++ gGpgKey
+               , "--prefix=" ++ dvDistro
+               , "--codename=" ++ dvCodeName
+               , pkgFile ]
+           -- Also upload to the old, incorrect location for people who still have their systems
+           -- configured with it.
+           () <- cmd "deb-s3 upload --preserve-versions --bucket download.fpcomplete.com"
                [ "--sign=" ++ gGpgKey
                , "--prefix=" ++ dvDistro ++ "/" ++ dvCodeName
                , pkgFile ]
@@ -292,7 +284,7 @@ rules global@Global{..} args = do
             copyFileChanged (releaseDir </> binaryExeFileName) out
         debStagedBashCompletionFile anyVersion0 %> \out -> do
             let dv = distroVersionFromPath out debVersions
-            writeBashCompletion (debStagedExeFile dv) (debStagingDir dv) out
+            writeBashCompletion (debStagedExeFile dv) out
         debStagedDocDir anyVersion0 ++ "//*" %> \out -> do
             let dv@DistroVersion{..} = distroVersionFromPath out debVersions
                 origFile = dropDirectoryPrefix (debStagedDocDir dv) out
@@ -342,15 +334,15 @@ rules global@Global{..} args = do
             copyFileChanged (releaseDir </> binaryExeFileName) out
         rpmStagedBashCompletionFile anyVersion0 %> \out -> do
             let dv = distroVersionFromPath out rpmVersions
-            writeBashCompletion (rpmStagedExeFile dv) (rpmStagingDir dv) out
+            writeBashCompletion (rpmStagedExeFile dv) out
         rpmStagedDocDir anyVersion0 ++ "//*" %> \out -> do
             let dv@DistroVersion{..} = distroVersionFromPath out rpmVersions
                 origFile = dropDirectoryPrefix (rpmStagedDocDir dv) out
             copyFileChanged origFile out
 
-    writeBashCompletion stagedStackExeFile stageDir out = do
+    writeBashCompletion stagedStackExeFile out = do
         need [stagedStackExeFile]
-        (Stdout bashCompletionScript) <- cmd [stagedStackExeFile] "--bash-completion-script" ["/" ++ dropDirectoryPrefix stageDir stagedStackExeFile]
+        (Stdout bashCompletionScript) <- cmd [stagedStackExeFile] "--bash-completion-script" [stackProgName]
         writeFileChanged out bashCompletionScript
 
     getBinaryPkgStageFiles = do
@@ -361,7 +353,7 @@ rules global@Global{..} args = do
         need stageFiles
         return stageFiles
 
-    getDocFiles = getDirectoryFiles "." ["LICENSE", "*.md", "doc//*"]
+    getDocFiles = getDirectoryFiles "." ["LICENSE", "*.md", "doc//*.md"]
 
     distroVersionFromPath path versions =
         let path' = dropDirectoryPrefix releaseDir path
@@ -386,8 +378,6 @@ rules global@Global{..} args = do
     buildPhony = "build"
     distroUploadPhony DistroVersion{..} = "upload-" ++ dvDistro ++ "-" ++ dvVersion
     distroBuildPhony DistroVersion{..} = "build-" ++ dvDistro ++ "-" ++ dvVersion
-    archUploadPhony = "upload-" ++ archDistro
-    archBuildPhony = "build-" ++ archDistro
 
     releaseCheckDir = releaseDir </> "check"
     releaseStageDir = releaseDir </> "stage"
@@ -432,14 +422,6 @@ rules global@Global{..} args = do
     rpmPackageIterationStr DistroVersion{..} = "0." ++ dvCodeName
     rpmPackageVersionStr _ = stackVersionStr global
 
-    archStagedDocDir = archStagingDir </> "usr/share/doc" </> stackProgName
-    archStagedBashCompletionFile = archStagingDir </> "usr/share/bash-completion/completions/stack"
-    archStagedExeFile = archStagingDir </> "usr/bin/stack"
-    archStagingDir = archDir </> archPackageName
-    archPackageFileName = archPackageName <.> tarGzExt
-    archPackageName = stackProgName ++ "_" ++ stackVersionStr global ++ "-" ++ "x86_64"
-    archDir = releaseDir </> archDistro
-
     ubuntuVersions =
         [ ("12.04", "precise")
         , ("14.04", "trusty")
@@ -454,13 +436,13 @@ rules global@Global{..} args = do
         , ("6", "el6") ]
     fedoraVersions =
         [ ("21", "fc21")
-        , ("22", "fc22") ]
+        , ("22", "fc22")
+        , ("23", "fc23") ]
 
     ubuntuDistro = "ubuntu"
     debianDistro = "debian"
     centosDistro = "centos"
     fedoraDistro = "fedora"
-    archDistro = "arch"
 
     anyDistroVersion distro = DistroVersion distro "*" "*"
 
@@ -604,6 +586,13 @@ binaryVariantOptName = "binary-variant"
 uploadLabelOptName :: String
 uploadLabelOptName = "upload-label"
 
+-- | @--no-test-haddocks@ command-line option name.
+noTestHaddocksOptName :: String
+noTestHaddocksOptName = "no-test-haddocks"
+
+buildArgsOptName :: String
+buildArgsOptName = "build-args"
+
 -- | Arguments to pass to all 'stack' invocations.
 stackArgs :: Global -> [String]
 stackArgs Global{..} = ["--install-ghc", "--arch=" ++ display gArch]
@@ -651,5 +640,7 @@ data Global = Global
     , gHomeDir :: !FilePath
     , gArch :: !Arch
     , gBinarySuffix :: !String
-    , gUploadLabel ::(Maybe String)}
+    , gUploadLabel :: (Maybe String)
+    , gTestHaddocks :: !Bool
+    , gBuildArgs :: [String] }
     deriving (Show)

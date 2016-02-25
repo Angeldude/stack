@@ -11,7 +11,7 @@ module Stack.Build.ConstructPlan
     ( constructPlan
     ) where
 
-import           Control.Arrow ((&&&))
+import           Control.Arrow ((&&&), second)
 import           Control.Exception.Lifted
 import           Control.Monad
 import           Control.Monad.Catch (MonadCatch)
@@ -19,7 +19,6 @@ import           Control.Monad.IO.Class
 import           Control.Monad.Logger (MonadLogger, logWarn)
 import           Control.Monad.RWS.Strict
 import           Control.Monad.Trans.Resource
-import qualified Data.ByteString.Char8 as S8
 import           Data.Either
 import           Data.Function
 import           Data.List
@@ -106,7 +105,7 @@ data Ctx = Ctx
     , ctxEnvConfig   :: !EnvConfig
     , callStack      :: ![PackageName]
     , extraToBuild   :: !(Set PackageName)
-    , latestVersions :: !(Map PackageName Version)
+    , ctxVersions    :: !(Map PackageName (Set Version))
     , wanted         :: !(Set PackageName)
     , localNames     :: !(Set PackageName)
     }
@@ -134,9 +133,9 @@ constructPlan :: forall env m.
 constructPlan mbp0 baseConfigOpts0 locals extraToBuild0 localDumpPkgs loadPackage0 sourceMap installedMap = do
     let locallyRegistered = Map.fromList $ map (dpGhcPkgId &&& dpPackageIdent) localDumpPkgs
     bconfig <- asks getBuildConfig
-    let latest =
-            Map.fromListWith max $
-            map toTuple $
+    let versions =
+            Map.fromListWith Set.union $
+            map (second Set.singleton . toTuple) $
             Map.keys (bcPackageCaches bconfig)
 
     econfig <- asks getEnvConfig
@@ -145,7 +144,7 @@ constructPlan mbp0 baseConfigOpts0 locals extraToBuild0 localDumpPkgs loadPackag
             mapM_ onWanted $ filter lpWanted locals
             mapM_ (addDep False) $ Set.toList extraToBuild0
     ((), m, W efinals installExes dirtyReason deps warnings) <-
-        liftIO $ runRWST inner (ctx econfig latest) M.empty
+        liftIO $ runRWST inner (ctx econfig versions) M.empty
     mapM_ $logWarn (warnings [])
     let toEither (_, Left e)  = Left e
         toEither (k, Right v) = Right (k, v)
@@ -158,7 +157,7 @@ constructPlan mbp0 baseConfigOpts0 locals extraToBuild0 localDumpPkgs loadPackag
                 toTask (name, ADRToInstall task) = Just (name, task)
                 tasks = M.fromList $ mapMaybe toTask adrs
                 takeSubset =
-                    case boptsBuildSubset $ bcoBuildOpts baseConfigOpts0 of
+                    case boptsCLIBuildSubset $ bcoBuildOptsCLI baseConfigOpts0 of
                         BSAll -> id
                         BSOnlySnapshot -> stripLocals
                         BSOnlyDependencies -> stripNonDeps deps
@@ -173,18 +172,18 @@ constructPlan mbp0 baseConfigOpts0 locals extraToBuild0 localDumpPkgs loadPackag
                 }
         else throwM $ ConstructPlanExceptions errs (bcStackYaml $ getBuildConfig econfig)
   where
-    ctx econfig latest = Ctx
+    ctx econfig versions = Ctx
         { mbp = mbp0
         , baseConfigOpts = baseConfigOpts0
         , loadPackage = loadPackage0
         , combinedMap = combineMap sourceMap installedMap
         , toolToPackages = \ (Dependency name _) ->
           maybe Map.empty (Map.fromSet (const anyVersion)) $
-          Map.lookup (S8.pack . packageNameString . fromCabalPackageName $ name) toolMap
+          Map.lookup (T.pack . packageNameString . fromCabalPackageName $ name) toolMap
         , ctxEnvConfig = econfig
         , callStack = []
         , extraToBuild = extraToBuild0
-        , latestVersions = latest
+        , ctxVersions = versions
         , wanted = wantedLocalPackages locals
         , localNames = Set.fromList $ map (packageName . lpPackage) locals
         }
@@ -431,14 +430,15 @@ addPackageDeps treatAsDep package = do
     deps' <- packageDepsWithTools package
     deps <- forM (Map.toList deps') $ \(depname, range) -> do
         eres <- addDep treatAsDep depname
-        let mlatest = Map.lookup depname $ latestVersions ctx
+        let mlatestApplicable =
+                (latestApplicableVersion range <=< Map.lookup depname) (ctxVersions ctx)
         case eres of
             Left e ->
                 let bd =
                         case e of
                             UnknownPackage name -> assert (name == depname) NotInBuildPlan
                             _ -> Couldn'tResolveItsDependencies
-                 in return $ Left (depname, (range, mlatest, bd))
+                 in return $ Left (depname, (range, mlatestApplicable, bd))
             Right adr -> do
                 inRange <- if adrVersion adr `withinRange` range
                     then return True
@@ -477,13 +477,11 @@ addPackageDeps treatAsDep package = do
                             (Set.empty, Map.empty, loc)
                         ADRFound loc (Library ident gid) -> return $ Right
                             (Set.empty, Map.singleton ident gid, loc)
-                    else return $ Left (depname, (range, mlatest, DependencyMismatch $ adrVersion adr))
+                    else return $ Left (depname, (range, mlatestApplicable, DependencyMismatch $ adrVersion adr))
     case partitionEithers deps of
         ([], pairs) -> return $ Right $ mconcat pairs
         (errs, _) -> return $ Left $ DependencyPlanFailures
-            (PackageIdentifier
-                (packageName package)
-                (packageVersion package))
+            package
             (Map.fromList errs)
   where
     adrVersion (ADRToInstall task) = packageIdentifierVersion $ taskProvides task
@@ -524,6 +522,7 @@ checkDirtiness ps installed package present wanted = do
                 Nothing -> Just "old configure information not found"
                 Just oldOpts
                     | Just reason <- describeConfigDiff config oldOpts wantConfigCache -> Just reason
+                    | True <- psForceDirty ps -> Just "--force-dirty specified"
                     | Just files <- psDirty ps -> Just $ "local file changes: " <>
                                                          addEllipsis (T.pack $ unwords $ Set.toList files)
                     | otherwise -> Nothing
@@ -536,8 +535,8 @@ checkDirtiness ps installed package present wanted = do
 
 describeConfigDiff :: Config -> ConfigCache -> ConfigCache -> Maybe Text
 describeConfigDiff config old new
-    | configCacheDeps old /= configCacheDeps new = Just "dependencies changed"
-    | not $ Set.null $ Set.filter isLibExe newComponents =
+    | not (configCacheDeps new `Set.isSubsetOf` configCacheDeps old) = Just "dependencies changed"
+    | not $ Set.null newComponents =
         Just $ "components added: " `T.append` T.intercalate ", "
             (map (decodeUtf8With lenientDecode) (Set.toList newComponents))
     | not (configCacheHaddock old) && configCacheHaddock new = Just "rebuilding with haddocks"
@@ -549,11 +548,6 @@ describeConfigDiff config old new
         ]
     | otherwise = Nothing
   where
-    isLibExe t = not $ any (`S8.isPrefixOf` t)
-        [ "test:"
-        , "bench:"
-        ]
-
     -- options set by stack
     isStackOpt t = any (`T.isPrefixOf` t)
         [ "--dependency="
@@ -561,8 +555,16 @@ describeConfigDiff config old new
         , "--package-db="
         , "--libdir="
         , "--bindir="
+        , "--datadir="
+        , "--libexecdir="
+        , "--sysconfdir"
+        , "--docdir="
+        , "--htmldir="
+        , "--haddockdir="
         , "--enable-tests"
         , "--enable-benchmarks"
+        ] || elem t
+        [ "--user"
         ]
 
     stripGhcOptions =
@@ -604,6 +606,10 @@ describeConfigDiff config old new
     removeMatching xs ys = (xs, ys)
 
     newComponents = configCacheComponents new `Set.difference` configCacheComponents old
+
+psForceDirty :: PackageSource -> Bool
+psForceDirty (PSLocal lp) = lpForceDirty lp
+psForceDirty (PSUpstream {}) = False
 
 psDirty :: PackageSource -> Maybe (Set FilePath)
 psDirty (PSLocal lp) = lpDirtyFiles lp

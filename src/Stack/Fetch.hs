@@ -7,6 +7,7 @@
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE TupleSections         #-}
+{-# LANGUAGE PackageImports        #-}
 {-# LANGUAGE ViewPatterns          #-}
 
 -- | Functionality for downloading packages securely for cabal's usage.
@@ -40,7 +41,7 @@ import           Control.Monad.IO.Class
 import           Control.Monad.Logger
 import           Control.Monad.Reader           (asks, runReaderT)
 import           Control.Monad.Trans.Control
-import           Crypto.Hash                    (SHA512 (..))
+import "cryptohash" Crypto.Hash                 (SHA512 (..))
 import           Data.ByteString                (ByteString)
 import qualified Data.ByteString                as S
 import qualified Data.ByteString.Lazy           as L
@@ -64,15 +65,12 @@ import           Data.Typeable                  (Typeable)
 import           Data.Word                      (Word64)
 import           Network.HTTP.Download
 import           Path
-import           Path.IO                         (dirExists, createTree)
+import           Path.IO
 import           Prelude -- Fix AMP warning
 import           Stack.GhcPkg
 import           Stack.PackageIndex
 import           Stack.Types
-import           System.Directory               (canonicalizePath,
-                                                 createDirectoryIfMissing,
-                                                 doesDirectoryExist,
-                                                 renameDirectory)
+import qualified System.Directory               as D
 import           System.FilePath                ((<.>))
 import qualified System.FilePath                as FP
 import           System.IO                      (IOMode (ReadMode),
@@ -139,7 +137,7 @@ unpackPackages :: (MonadIO m, MonadBaseControl IO m, MonadReader env m, HasHttpM
                -> [String] -- ^ names or identifiers
                -> m ()
 unpackPackages menv dest input = do
-    dest' <- liftIO (canonicalizePath dest) >>= parseAbsDir
+    dest' <- resolveDir' dest
     (names, idents) <- case partitionEithers $ map parse input of
         ([], x) -> return $ partitionEithers x
         (errs, _) -> throwM $ CouldNotParsePackageSelectors errs
@@ -383,7 +381,7 @@ getToFetch mdest resolvedAll = do
             case mdestDir of
                 Nothing -> return Nothing
                 Just destDir -> do
-                    exists <- dirExists destDir
+                    exists <- doesDirExist destDir
                     return $ if exists then Just destDir else Nothing
         case mexists of
             Just destDir -> return $ Right (ident, destDir)
@@ -464,7 +462,7 @@ fetchPackages' mdistDir toFetchAll = do
             let dest = toFilePath $ parent destDir
                 innerDest = toFilePath destDir
 
-            liftIO $ createDirectoryIfMissing True dest
+            liftIO $ ensureDir (parent destDir)
 
             liftIO $ withBinaryFile fp ReadMode $ \h -> do
                 -- Avoid using L.readFile, which is more likely to leak
@@ -497,15 +495,15 @@ fetchPackages' mdistDir toFetchAll = do
                         let inner = dest FP.</> identStr
                             oldDist = inner FP.</> "dist"
                             newDist = inner FP.</> toFilePath distDir
-                        exists <- doesDirectoryExist oldDist
+                        exists <- D.doesDirectoryExist oldDist
                         when exists $ do
                             -- Previously used takeDirectory, but that got confused
                             -- by trailing slashes, see:
                             -- https://github.com/commercialhaskell/stack/issues/216
                             --
                             -- Instead, use Path which is a bit more resilient
-                            createTree . parent =<< parseAbsDir newDist
-                            renameDirectory oldDist newDist
+                            ensureDir . parent =<< parseAbsDir newDist
+                            D.renameDirectory oldDist newDist
 
                 let cabalFP =
                         innerDest FP.</>

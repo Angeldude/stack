@@ -4,12 +4,9 @@
 -- | Constants used throughout the project.
 
 module Stack.Constants
-    (builtConfigFileFromDir
-    ,builtFileFromDir
-    ,buildPlanDir
-    ,configuredFileFromDir
-    ,defaultShakeThreads
+    (buildPlanDir
     ,distDirFromDir
+    ,workDirFromDir
     ,distRelativeDir
     ,haskellModuleExts
     ,imageStagingDir
@@ -17,14 +14,14 @@ module Stack.Constants
     ,rawGithubUrl
     ,stackDotYaml
     ,stackRootEnvVar
-    ,userDocsDir
+    ,inContainerEnvVar
     ,configCacheFile
     ,configCabalMod
     ,buildCacheFile
     ,testSuccessFile
     ,testBuiltFile
-    ,benchBuiltFile
     ,stackProgName
+    ,stackProgNameUpper
     ,wiredInPackages
     ,ghcjsBootPackages
     ,cabalPackageName
@@ -38,11 +35,13 @@ module Stack.Constants
     ,defaultUserConfigPath
     ,defaultGlobalConfigPathDeprecated
     ,defaultGlobalConfigPath
+    ,platformVariantEnvVar
     )
     where
 
 import           Control.Monad.Catch (MonadThrow)
 import           Control.Monad.Reader
+import           Data.Char (toUpper)
 import           Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
 import           Data.Text (Text)
@@ -66,61 +65,12 @@ haskellFileExts = ["hs", "hsc", "lhs"]
 haskellPreprocessorExts :: [Text]
 haskellPreprocessorExts = ["gc", "chs", "hsc", "x", "y", "ly", "cpphs"]
 
--- | The filename used for completed build indicators.
-builtFileFromDir :: (MonadThrow m, MonadReader env m, HasPlatform env,HasEnvConfig env)
-                 => Path Abs Dir
-                 -> m (Path Abs File)
-builtFileFromDir fp = do
-  dist <- distDirFromDir fp
-  return (dist </> $(mkRelFile "stack.gen"))
-
--- | The filename used for completed configure indicators.
-configuredFileFromDir :: (MonadThrow m, MonadReader env m, HasPlatform env,HasEnvConfig env)
-                      => Path Abs Dir
-                      -> m (Path Abs File)
-configuredFileFromDir fp = do
-  dist <- distDirFromDir fp
-  return (dist </> $(mkRelFile "setup-config"))
-
--- | The filename used for completed build indicators.
-builtConfigFileFromDir :: (MonadThrow m, MonadReader env m, HasPlatform env,HasEnvConfig env)
-                       => Path Abs Dir
-                       -> m (Path Abs File)
-builtConfigFileFromDir fp =
-    liftM (fp </>) builtConfigRelativeFile
-
--- | Relative location of completed build indicators.
-builtConfigRelativeFile :: (MonadThrow m, MonadReader env m, HasPlatform env,HasEnvConfig env)
-                        => m (Path Rel File)
-builtConfigRelativeFile = do
-  dist <- distRelativeDir
-  return (dist </> $(mkRelFile "stack.config"))
-
--- | Default shake thread count for parallel builds.
-defaultShakeThreads :: Int
-defaultShakeThreads = 4
-
--- -- | Hoogle database file.
--- hoogleDatabaseFile :: Path Abs Dir -> Path Abs File
--- hoogleDatabaseFile docLoc =
---   docLoc </>
---   $(mkRelFile "default.hoo")
-
--- -- | Extension for hoogle databases.
--- hoogleDbExtension :: String
--- hoogleDbExtension = "hoo"
-
--- -- | Extension of haddock files
--- haddockExtension :: String
--- haddockExtension = "haddock"
-
--- | User documentation directory.
-userDocsDir :: Config -> Path Abs Dir
-userDocsDir config = configStackRoot config </> $(mkRelDir "doc/")
-
 -- | Output .o/.hi directory.
-objectInterfaceDir :: BuildConfig -> Path Abs Dir
-objectInterfaceDir bconfig = bcWorkDir bconfig </> $(mkRelDir "odir/")
+objectInterfaceDir :: (MonadReader env m, HasConfig env)
+  => BuildConfig -> m (Path Abs Dir)
+objectInterfaceDir bconfig = do
+  bcwd <- bcWorkDir bconfig
+  return (bcwd </> $(mkRelDir "odir/"))
 
 -- | The filename used for dirtiness check of source files.
 buildCacheFile :: (MonadThrow m, MonadReader env m, HasPlatform env,HasEnvConfig env)
@@ -147,15 +97,6 @@ testBuiltFile :: (MonadThrow m, MonadReader env m, HasPlatform env,HasEnvConfig 
 testBuiltFile dir =
     liftM
         (</> $(mkRelFile "stack-test-built"))
-        (distDirFromDir dir)
-
--- | The filename used to mark benchmarks as having built
-benchBuiltFile :: (MonadThrow m, MonadReader env m, HasPlatform env,HasEnvConfig env)
-               => Path Abs Dir -- ^ Package directory
-               -> m (Path Abs File)
-benchBuiltFile dir =
-    liftM
-        (</> $(mkRelFile "stack-bench-built"))
         (distDirFromDir dir)
 
 -- | The filename used for dirtiness check of config.
@@ -197,6 +138,13 @@ distDirFromDir :: (MonadThrow m, MonadReader env m, HasPlatform env, HasEnvConfi
 distDirFromDir fp =
     liftM (fp </>) distRelativeDir
 
+-- | Package's working directory.
+workDirFromDir :: (MonadThrow m, MonadReader env m, HasPlatform env, HasEnvConfig env)
+               => Path Abs Dir
+               -> m (Path Abs Dir)
+workDirFromDir fp =
+    liftM (fp </>) getWorkDir
+
 -- | Directory for project templates.
 templatesDir :: Config -> Path Abs Dir
 templatesDir config = configStackRoot config </> $(mkRelDir "templates")
@@ -206,7 +154,7 @@ distRelativeDir :: (MonadThrow m, MonadReader env m, HasPlatform env, HasEnvConf
                 => m (Path Rel Dir)
 distRelativeDir = do
     cabalPkgVer <- asks (envConfigCabalVersion . getEnvConfig)
-    platform <- platformVariantRelDir
+    platform <- platformGhcRelDir
     wc <- getWhichCompiler
     -- Cabal version, suffixed with "_ghcjs" if we're using GHCJS.
     envDir <-
@@ -215,8 +163,9 @@ distRelativeDir = do
         packageIdentifierString $
         PackageIdentifier cabalPackageName cabalPkgVer
     platformAndCabal <- useShaPathOnWindows (platform </> envDir)
+    workDir <- getWorkDir
     return $
-        workDirRel </>
+        workDir </>
         $(mkRelDir "dist") </>
         platformAndCabal
 
@@ -237,27 +186,27 @@ rawGithubUrl org repo branch file = T.concat
     , file
     ]
 
--- -- | Hoogle database file.
--- hoogleDatabaseFile :: Path Abs Dir -> Path Abs File
--- hoogleDatabaseFile docLoc =
---   docLoc </>
---   $(mkRelFile "default.hoo")
-
--- -- | Extension for hoogle databases.
--- hoogleDbExtension :: String
--- hoogleDbExtension = "hoo"
-
--- -- | Extension of haddock files
--- haddockExtension :: String
--- haddockExtension = "haddock"
-
 -- | Docker sandbox from project root.
-projectDockerSandboxDir :: Path Abs Dir -> Path Abs Dir
-projectDockerSandboxDir projectRoot = projectRoot </> workDirRel </> $(mkRelDir "docker/")
+projectDockerSandboxDir :: (MonadReader env m, HasConfig env)
+  => Path Abs Dir      -- ^ Project root
+  -> m (Path Abs Dir)  -- ^ Docker sandbox
+projectDockerSandboxDir projectRoot = do
+  workDir <- getWorkDir
+  return $ projectRoot </> workDir </> $(mkRelDir "docker/")
 
 -- | Image staging dir from project root.
-imageStagingDir :: Path Abs Dir -> Path Abs Dir
-imageStagingDir p = p </> workDirRel </> $(mkRelDir "image/")
+imageStagingDir :: (MonadReader env m, HasConfig env, MonadThrow m)
+  => Path Abs Dir      -- ^ Project root
+  -> Int               -- ^ Index of image
+  -> m (Path Abs Dir)  -- ^ Docker sandbox
+imageStagingDir projectRoot imageIdx = do
+  workDir <- getWorkDir
+  idxRelDir <- parseRelDir (show imageIdx)
+  return $ projectRoot </> workDir </> $(mkRelDir "image") </> idxRelDir
+
+-- | Name of the 'stack' program, uppercased
+stackProgNameUpper :: String
+stackProgNameUpper = map toUpper stackProgName
 
 -- | Name of the 'stack' program.
 stackProgName :: String
@@ -270,6 +219,10 @@ stackDotYaml = $(mkRelFile "stack.yaml")
 -- | Environment variable used to override the '~/.stack' location.
 stackRootEnvVar :: String
 stackRootEnvVar = "STACK_ROOT"
+
+-- | Environment variable used to indicate stack is running in container.
+inContainerEnvVar :: String
+inContainerEnvVar = stackProgNameUpper ++ "_IN_CONTAINER"
 
 -- See https://downloads.haskell.org/~ghc/7.10.1/docs/html/libraries/ghc/src/Module.html#integerPackageKey
 wiredInPackages :: HashSet PackageName
@@ -380,3 +333,8 @@ defaultGlobalConfigPath = parseAbsFile "/etc/stack/config.yaml"
 buildPlanDir :: Path Abs Dir -- ^ Stack root
              -> Path Abs Dir
 buildPlanDir = (</> $(mkRelDir "build-plan"))
+
+-- | Environment variable that stores a variant to append to platform-specific directory
+-- names.  Used to ensure incompatible binaries aren't shared between Docker builds and host
+platformVariantEnvVar :: String
+platformVariantEnvVar = stackProgNameUpper ++ "_PLATFORM_VARIANT"

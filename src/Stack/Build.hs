@@ -4,7 +4,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
@@ -29,8 +28,13 @@ import           Data.Aeson (Value (Object, Array), (.=), object)
 import           Data.Function
 import qualified Data.HashMap.Strict as HM
 import           Data.IORef.RunOnce (runOnce)
+import           Data.List ((\\))
+import           Data.List.Extra (groupSort)
+import           Data.List.NonEmpty (NonEmpty(..))
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
 import           Data.Map.Strict (Map)
+import           Data.Monoid
 import           Data.Set (Set)
 import qualified Data.Set as Set
 import           Data.Text (Text)
@@ -71,12 +75,14 @@ type M env m = (MonadIO m,MonadReader env m,HasHttpManager env,HasBuildConfig en
 build :: M env m
       => (Set (Path Abs File) -> IO ()) -- ^ callback after discovering all local files
       -> Maybe FileLock
-      -> BuildOpts
+      -> BuildOptsCLI
       -> m ()
-build setLocalFiles mbuildLk bopts = fixCodePage' $ do
+build setLocalFiles mbuildLk boptsCli = fixCodePage $ do
+    bopts <- asks (configBuild . getConfig)
+    let profiling = boptsLibProfile bopts || boptsExeProfile bopts
     menv <- getMinimalEnvOverride
 
-    (_, mbp, locals, extraToBuild, sourceMap) <- loadSourceMap NeedTargets bopts
+    (_, mbp, locals, extraToBuild, sourceMap) <- loadSourceMap NeedTargets boptsCli
 
     -- Set local files, necessary for file watching
     stackYaml <- asks $ bcStackYaml . getBuildConfig
@@ -92,7 +98,7 @@ build setLocalFiles mbuildLk bopts = fixCodePage' $ do
                          , getInstalledHaddock   = shouldHaddockDeps bopts }
                      sourceMap
 
-    baseConfigOpts <- mkBaseConfigOpts bopts
+    baseConfigOpts <- mkBaseConfigOpts boptsCli
     plan <- withLoadPackage menv $ \loadPackage ->
         constructPlan mbp baseConfigOpts locals extraToBuild localDumpPkgs loadPackage sourceMap installedMap
 
@@ -106,19 +112,19 @@ build setLocalFiles mbuildLk bopts = fixCodePage' $ do
                            liftIO $ unlockFile lk
       _ -> return ()
 
+    warnIfExecutablesWithSameNameCouldBeOverwritten locals plan
+
     when (boptsPreFetch bopts) $
         preFetch plan
 
-    if boptsDryrun bopts
+    if boptsCLIDryrun boptsCli
         then printPlan plan
-        else executePlan menv bopts baseConfigOpts locals
+        else executePlan menv boptsCli baseConfigOpts locals
                          globalDumpPkgs
                          snapshotDumpPkgs
                          localDumpPkgs
                          installedMap
                          plan
-  where
-    profiling = boptsLibProfile bopts || boptsExeProfile bopts
 
 -- | If all the tasks are local, they don't mutate anything outside of our local directory.
 allLocal :: Plan -> Bool
@@ -128,10 +134,84 @@ allLocal =
     Map.elems .
     planTasks
 
+-- | See https://github.com/commercialhaskell/stack/issues/1198.
+warnIfExecutablesWithSameNameCouldBeOverwritten
+    :: MonadLogger m => [LocalPackage] -> Plan -> m ()
+warnIfExecutablesWithSameNameCouldBeOverwritten locals plan =
+    forM_ (Map.toList warnings) $ \(exe,(toBuild,otherLocals)) -> do
+        let exe_s
+                | length toBuild > 1 = "several executables with the same name:"
+                | otherwise = "executable"
+            exesText pkgs =
+                T.intercalate
+                    ", "
+                    ["'" <> packageNameText p <> ":" <> exe <> "'" | p <- pkgs]
+        ($logWarn . T.unlines . concat)
+            [ [ "Building " <> exe_s <> " " <> exesText toBuild <> "." ]
+            , [ "Only one of them will be available via 'stack exec' or locally installed."
+              | length toBuild > 1
+              ]
+            , [ "Other executables with the same name might be overwritten: " <>
+                exesText otherLocals <> "."
+              | not (null otherLocals)
+              ]
+            ]
+  where
+    -- Cases of several local packages having executables with the same name.
+    -- The Map entries have the following form:
+    --
+    --  executable name: ( package names for executables that are being built
+    --                   , package names for other local packages that have an
+    --                     executable with the same name
+    --                   )
+    warnings :: Map Text ([PackageName],[PackageName])
+    warnings =
+        Map.mapMaybe
+            (\(pkgsToBuild,localPkgs) ->
+                case (pkgsToBuild,NE.toList localPkgs \\ NE.toList pkgsToBuild) of
+                    (_ :| [],[]) ->
+                        -- We want to build the executable of single local package
+                        -- and there are no other local packages with an executable of
+                        -- the same name. Nothing to warn about, ignore.
+                        Nothing
+                    (_,otherLocals) ->
+                        -- We could be here for two reasons (or their combination):
+                        -- 1) We are building two or more executables with the same
+                        --    name that will end up overwriting each other.
+                        -- 2) In addition to the executable(s) that we want to build
+                        --    there are other local packages with an executable of the
+                        --    same name that might get overwritten.
+                        -- Both cases warrant a warning.
+                        Just (NE.toList pkgsToBuild,otherLocals))
+            (Map.intersectionWith (,) exesToBuild localExes)
+    exesToBuild :: Map Text (NonEmpty PackageName)
+    exesToBuild =
+        collect
+            [ (exe,pkgName)
+            | (pkgName,task) <- Map.toList (planTasks plan)
+            , isLocal task
+            , exe <- (Set.toList . exeComponents . lpComponents . taskLP) task
+            ]
+      where
+        isLocal Task{taskType = (TTLocal _)} = True
+        isLocal _ = False
+        taskLP Task{taskType = (TTLocal lp)} = lp
+        taskLP _ = error "warnIfExecutablesWithSameNameCouldBeOverwritten/taskLP: task isn't local"
+    localExes :: Map Text (NonEmpty PackageName)
+    localExes =
+        collect
+            [ (exe,packageName pkg)
+            | pkg <- map lpPackage locals
+            , exe <- Set.toList (packageExes pkg)
+            ]
+    collect :: Ord k => [(k,v)] -> Map k (NonEmpty v)
+    collect = Map.map NE.fromList . Map.fromDistinctAscList . groupSort
+
 -- | Get the @BaseConfigOpts@ necessary for constructing configure options
 mkBaseConfigOpts :: (MonadIO m, MonadReader env m, HasEnvConfig env, MonadThrow m)
-                 => BuildOpts -> m BaseConfigOpts
-mkBaseConfigOpts bopts = do
+                 => BuildOptsCLI -> m BaseConfigOpts
+mkBaseConfigOpts boptsCli = do
+    bopts <- asks (configBuild . getConfig)
     snapDBPath <- packageDatabaseDeps
     localDBPath <- packageDatabaseLocal
     snapInstallRoot <- installationRootDeps
@@ -143,6 +223,7 @@ mkBaseConfigOpts bopts = do
         , bcoSnapInstallRoot = snapInstallRoot
         , bcoLocalInstallRoot = localInstallRoot
         , bcoBuildOpts = bopts
+        , bcoBuildOptsCLI = boptsCli
         , bcoExtraDBs = packageExtraDBs
         }
 
@@ -182,35 +263,42 @@ withLoadPackage menv inner = do
 
 -- | Set the code page for this process as necessary. Only applies to Windows.
 -- See: https://github.com/commercialhaskell/stack/issues/738
-fixCodePage :: (MonadIO m, MonadMask m, MonadLogger m) => m a -> m a
+fixCodePage :: M env m => m a -> m a
 #ifdef WINDOWS
 fixCodePage inner = do
-    origCPI <- liftIO getConsoleCP
-    origCPO <- liftIO getConsoleOutputCP
-
-    let setInput = origCPI /= expected
-        setOutput = origCPO /= expected
-        fixInput
-            | setInput = Catch.bracket_
-                (liftIO $ do
-                    setConsoleCP expected)
-                (liftIO $ setConsoleCP origCPI)
-            | otherwise = id
-        fixOutput
-            | setInput = Catch.bracket_
-                (liftIO $ do
-                    setConsoleOutputCP expected)
-                (liftIO $ setConsoleOutputCP origCPO)
-            | otherwise = id
-
-    case (setInput, setOutput) of
-        (False, False) -> return ()
-        (True, True) -> warn ""
-        (True, False) -> warn " input"
-        (False, True) -> warn " output"
-
-    fixInput $ fixOutput inner
+    mcp <- asks $ configModifyCodePage . getConfig
+    ec <- asks getEnvConfig
+    if mcp && getGhcVersion (envConfigCompilerVersion ec) < $(mkVersion "7.10.3")
+        then fixCodePage'
+        -- GHC >=7.10.3 doesn't need this code page hack.
+        else inner
   where
+    fixCodePage' = do
+        origCPI <- liftIO getConsoleCP
+        origCPO <- liftIO getConsoleOutputCP
+
+        let setInput = origCPI /= expected
+            setOutput = origCPO /= expected
+            fixInput
+                | setInput = Catch.bracket_
+                    (liftIO $ do
+                        setConsoleCP expected)
+                    (liftIO $ setConsoleCP origCPI)
+                | otherwise = id
+            fixOutput
+                | setInput = Catch.bracket_
+                    (liftIO $ do
+                        setConsoleOutputCP expected)
+                    (liftIO $ setConsoleOutputCP origCPO)
+                | otherwise = id
+
+        case (setInput, setOutput) of
+            (False, False) -> return ()
+            (True, True) -> warn ""
+            (True, False) -> warn " input"
+            (False, True) -> warn " output"
+
+        fixInput $ fixOutput inner
     expected = 65001 -- UTF-8
     warn typ = $logInfo $ T.concat
         [ "Setting"
@@ -220,15 +308,6 @@ fixCodePage inner = do
 #else
 fixCodePage = id
 #endif
-
-fixCodePage' :: (MonadIO m, MonadMask m, MonadLogger m, MonadReader env m, HasConfig env)
-             => m a
-             -> m a
-fixCodePage' inner = do
-    mcp <- asks $ configModifyCodePage . getConfig
-    if mcp
-        then fixCodePage inner
-        else inner
 
 -- | Query information about the build and print the result to stdout in YAML format.
 queryBuildInfo :: M env m
@@ -260,7 +339,7 @@ queryBuildInfo selectors0 =
 -- | Get the raw build information object
 rawBuildInfo :: M env m => m Value
 rawBuildInfo = do
-    (_, _mbp, locals, _extraToBuild, _sourceMap) <- loadSourceMap NeedTargets defaultBuildOpts
+    (_, _mbp, locals, _extraToBuild, _sourceMap) <- loadSourceMap NeedTargets defaultBuildOptsCLI
     return $ object
         [ "locals" .= Object (HM.fromList $ map localToPair locals)
         ]

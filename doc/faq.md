@@ -1,3 +1,5 @@
+# FAQ
+
 So that this doesn't become repetitive: for the reasons behind the answers
 below, see the [Architecture](architecture.md) page. The goal of the answers here is to be as
 helpful and concise as possible.
@@ -41,6 +43,16 @@ extra-deps: []
 ```
 
 The above example specifies that the `proprietary-dep` package is found in the project's `third-party` folder, that the `conduit` package is found in the project's `github-version-of` folder, and that the `diagrams` package is found in the project's `patched` folder. This autodetects changes and reinstalls the package.
+
+To install packages directly from a Git repository, use e.g.:
+
+```yaml
+resolver: lts-2.10
+packages:
+- location:
+    git: https://github.com/githubuser/reponame.git
+    commit: somecommitID
+```
 
 #### What is the meaning of the arguments given to stack build, test, etc?
 
@@ -235,6 +247,13 @@ A custom temporary directory can be forced:
 * on Linux by setting the environment variable TMPDIR (eg `$ TMPDIR=path-to-tmp stack setup`)
 * on Windows by setting one of the environment variable (given in priority order), TMP, TEMP, USERPROFILE
 
+If you use Stack with Nix integration, be aware that Nix _also_ uses that TMPDIR
+variable, and if it is not set Nix sets it to some subdirectory of `/run`, which
+on most Linuxes is a Ramdir. Nix will run the builds in TMPDIR, therefore if you
+don't have enough RAM you will get errors about disk space.  If this happens to
+you, please _manually_ set TMPDIR before launching Stack to some directory on the
+disk.
+
 #### stack sometimes rebuilds based on flag changes when I wouldn't expect it to. How come?
 
 stack tries to give you reproducibility whenever possible. In some cases, this means that you get a recompile when one may not seem necessary. The most common example is running something like this in a multi-package project:
@@ -259,8 +278,8 @@ See [issue #644](https://github.com/commercialhaskell/stack/issues/644) for more
 
 #### I get strange `ld` errors about recompiling with "-fPIC"
 
-Some users (myself included!) have come across a linker errors (example below) that seem to be dependent on the local environment, i.e. the package may compile on a different machine. There is no known workaround (if you come across one please include details), however the issue has been reported to be [non-deterministic]
-(https://github.com/commercialhaskell/stack/issues/614) in some cases. I've had success using the docker functionality to build the project on a machine that would not compile it otherwise.
+Some users (myself included!) have come across a linker errors (example below) that seem to be dependent on the local environment, i.e. the package may compile on a different machine. There is no known workaround (if you come across one please include details), however the issue has been reported to be [non-deterministic](https://github.com/commercialhaskell/stack/issues/614)
+in some cases. I've had success using the docker functionality to build the project on a machine that would not compile it otherwise.
 
 ```
 tmp-0.1.0.0: build
@@ -279,3 +298,35 @@ collect2: error: ld returned 1 exit status
 #### Where does the output from `--ghc-options=-ddump-splices` (and other `-ddump*` options) go?
 
 These are written to `*.dump-*` files inside the package's `.stack-work` directory.
+
+#### Why is DYLD_LIBRARY_PATH ignored?
+
+<a name="dyld-library-path-ignored"></a>If you
+are on Mac OS X 10.11 ("El Capitan") or later, there are upstream issues which
+[prevent the `DYLD_LIBRARY_PATH` environment variable from being passed to GHC](https://github.com/commercialhaskell/stack/issues/1161)
+when System Integrity Protection (a.k.a. "rootless") is enabled. The only
+workaround we are aware of is
+[disabling System Integrity Protection](http://osxdaily.com/2015/10/05/disable-rootless-system-integrity-protection-mac-os-x/).
+
+**WARNING: Disabling SIP will severely reduce the security of your system, so only do this if absolutely necessary!**
+
+#### Why do I get a `/usr/bin/ar: permission denied` error?
+
+<a name="usr-bin-ar-permission-denied"></a>If you are on OS X 10.11 ("El Capitan") or
+later, GHC 7.8.4 is
+[incompatible with System Integrity Protection (a.k.a. "rootless")](https://github.com/commercialhaskell/stack/issues/563).
+GHC 7.10.2 includes a fix, so this only affects users of GHC 7.8.4. If you
+cannot upgrade to GHC 7.10.2, you can work around it by
+[disabling System Integrity Protection](http://osxdaily.com/2015/10/05/disable-rootless-system-integrity-protection-mac-os-x/).
+
+**WARNING: Disabling SIP will severely reduce the security of your system, so only do this if absolutely necessary!**
+
+#### Why is the `--` argument separator ignored in Windows PowerShell
+
+Some versions of Windows PowerShell
+[don't pass the `--` to programs](https://github.com/commercialhaskell/stack/issues/813).
+The workaround is to quote the `"--"`, e.g.:
+
+    stack exec "--" cabal --version
+
+This is known to be a problem on Windows 7, but seems to be fixed on Windows 10.

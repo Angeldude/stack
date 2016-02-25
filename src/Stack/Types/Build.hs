@@ -64,15 +64,16 @@ import           Data.Text.Encoding.Error (lenientDecode)
 import           Data.Time.Calendar
 import           Data.Time.Clock
 import           Distribution.System (Arch)
+import           Distribution.PackageDescription (TestSuiteInterface)
 import           Distribution.Text (display)
 import           GHC.Generics
 import           Path (Path, Abs, File, Dir, mkRelDir, toFilePath, parseRelDir, (</>))
 import           Path.Extra (toFilePathNoTrailingSep)
 import           Prelude
-import           Stack.Types.FlagName
-import           Stack.Types.GhcPkgId
 import           Stack.Types.Compiler
 import           Stack.Types.Config
+import           Stack.Types.FlagName
+import           Stack.Types.GhcPkgId
 import           Stack.Types.Package
 import           Stack.Types.PackageIdentifier
 import           Stack.Types.PackageName
@@ -99,6 +100,7 @@ data StackBuildException
     (Map PackageName Version) -- not in snapshot, here's the most recent version in the index
     (Path Abs File) -- stack.yaml
   | TestSuiteFailure PackageIdentifier (Map Text (Maybe ExitCode)) (Maybe (Path Abs File)) S.ByteString
+  | TestSuiteTypeUnsupported TestSuiteInterface
   | ConstructPlanExceptions
         [ConstructPlanException]
         (Path Abs File) -- stack.yaml
@@ -108,7 +110,7 @@ data StackBuildException
         (Path Abs File)  -- cabal Executable
         [String]         -- cabal arguments
         (Maybe (Path Abs File)) -- logfiles location
-        S.ByteString     -- log contents
+        [Text]     -- log contents
   | ExecutionFailure [SomeException]
   | LocalPackageDoesn'tMatchTarget
         PackageName
@@ -118,9 +120,8 @@ data StackBuildException
   | InvalidFlagSpecification (Set UnusedFlags)
   | TargetParseException [Text]
   | DuplicateLocalPackageNames [(PackageName, [Path Abs Dir])]
+  | SolverGiveUp String
   | SolverMissingCabalInstall
-  | SolverMissingGHC
-  | SolverNoCabalFiles
   | SomeTargetsNotBuildable [(PackageName, NamedComponent)]
   deriving Typeable
 
@@ -209,6 +210,8 @@ instance Show StackBuildException where
          where
           indent = dropWhileEnd isSpace . unlines . fmap (\line -> "  " ++ line) . lines
           doubleIndent = indent . indent
+    show (TestSuiteTypeUnsupported interface) =
+              ("Unsupported test suite type: " <> show interface)
     show (ConstructPlanExceptions exceptions stackYaml) =
         "While constructing the BuildPlan the following exceptions were encountered:" ++
         appendExceptions exceptions' ++
@@ -238,7 +241,7 @@ instance Show StackBuildException where
                     Map.singleton name version
                 go _ = Map.empty
      -- Supressing duplicate output
-    show (CabalExitedUnsuccessfully exitCode taskProvides' execName fullArgs logFiles bs) =
+    show (CabalExitedUnsuccessfully exitCode taskProvides' execName fullArgs logFiles bss) =
         let fullCmd = unwords
                     $ dropQuotes (toFilePath execName)
                     : map (T.unpack . showProcessArgDebug) fullArgs
@@ -250,14 +253,12 @@ instance Show StackBuildException where
                 then " (THIS MAY INDICATE OUT OF MEMORY)"
                 else "") ++
            logLocations ++
-           (if S.null bs
+           (if null bss
                 then ""
-                else "\n\n" ++ doubleIndent (T.unpack $ decodeUtf8With lenientDecode bs))
+                else "\n\n" ++ doubleIndent (map T.unpack bss))
          where
-          -- appendLines = foldr (\pName-> (++) ("\n" ++ show pName)) ""
-          indent = dropWhileEnd isSpace . unlines . fmap (\line -> "  " ++ line) . lines
+          doubleIndent = dropWhileEnd isSpace . unlines . fmap (\line -> "    " ++ line)
           dropQuotes = filter ('\"' /=)
-          doubleIndent = indent . indent
     show (ExecutionFailure es) = intercalate "\n\n" $ map show es
     show (LocalPackageDoesn'tMatchTarget name localV requestedV) = concat
         [ "Version for local package "
@@ -320,17 +321,14 @@ instance Show StackBuildException where
             : (packageNameString name ++ " used in:")
             : map goDir dirs
         goDir dir = "- " ++ toFilePath dir
+    show (SolverGiveUp msg) = concat
+        [ "\nSolver could not resolve package dependencies.\n"
+        , "You can try the following:\n"
+        , msg
+        ]
     show SolverMissingCabalInstall = unlines
         [ "Solver requires that cabal be on your PATH"
         , "Try running 'stack install cabal-install'"
-        ]
-    show SolverMissingGHC = unlines
-        [ "Solver requires that GHC be on your PATH"
-        , "Try running 'stack setup'"
-        ]
-    show SolverNoCabalFiles = unlines
-        [ "No cabal files provided.  Maybe this is due to not having a stack.yaml file?"
-        , "Try running 'stack init' to create a stack.yaml"
         ]
     show (SomeTargetsNotBuildable xs) =
         "The following components have 'buildable: False' set in the cabal configuration, and so cannot be targets:\n    " ++
@@ -341,13 +339,13 @@ instance Exception StackBuildException
 
 data ConstructPlanException
     = DependencyCycleDetected [PackageName]
-    | DependencyPlanFailures PackageIdentifier (Map PackageName (VersionRange, LatestVersion, BadDependency))
+    | DependencyPlanFailures Package (Map PackageName (VersionRange, LatestApplicableVersion, BadDependency))
     | UnknownPackage PackageName -- TODO perhaps this constructor will be removed, and BadDependency will handle it all
     -- ^ Recommend adding to extra-deps, give a helpful version number?
     deriving (Typeable, Eq)
 
 -- | For display purposes only, Nothing if package not found
-type LatestVersion = Maybe Version
+type LatestApplicableVersion = Maybe Version
 
 -- | Reason why a dependency was not used
 data BadDependency
@@ -362,9 +360,10 @@ instance Show ConstructPlanException where
          (DependencyCycleDetected pNames) ->
            "While checking call stack,\n" ++
            "  dependency cycle detected in packages:" ++ indent (appendLines pNames)
-         (DependencyPlanFailures pIdent (Map.toList -> pDeps)) ->
+         (DependencyPlanFailures pkg (Map.toList -> pDeps)) ->
            "Failure when adding dependencies:" ++ doubleIndent (appendDeps pDeps) ++ "\n" ++
-           "  needed for package: " ++ packageIdentifierString pIdent
+           "  needed for package " ++ packageIdentifierString (packageIdentifier pkg) ++
+           appendFlags (packageFlags pkg)
          (UnknownPackage pName) ->
              "While attempting to add dependency,\n" ++
              "  Could not find package " ++ show pName  ++ " in known packages"
@@ -373,27 +372,33 @@ instance Show ConstructPlanException where
       appendLines = foldr (\pName-> (++) ("\n" ++ show pName)) ""
       indent = dropWhileEnd isSpace . unlines . fmap (\line -> "  " ++ line) . lines
       doubleIndent = indent . indent
+      appendFlags flags =
+          if Map.null flags
+              then ""
+              else " with flags:\n" ++
+                  (doubleIndent . intercalate "\n" . map showFlag . Map.toList) flags
+      showFlag (name, bool) = show name ++ ": " ++ show bool
       appendDeps = foldr (\dep-> (++) ("\n" ++ showDep dep)) ""
-      showDep (name, (range, mlatest, badDep)) = concat
+      showDep (name, (range, mlatestApplicable, badDep)) = concat
         [ show name
         , ": needed ("
         , display range
         , ")"
         , ", "
-        , let latestStr =
-                case mlatest of
+        , let latestApplicableStr =
+                case mlatestApplicable of
                     Nothing -> ""
-                    Just latest -> " (latest is " ++ versionString latest ++ ")"
+                    Just la -> " (latest applicable is " ++ versionString la ++ ")"
            in case badDep of
-                NotInBuildPlan -> "not present in build plan" ++ latestStr
+                NotInBuildPlan -> "stack configuration has no specified version" ++ latestApplicableStr
                 Couldn'tResolveItsDependencies -> "couldn't resolve its dependencies"
                 DependencyMismatch version ->
-                    case mlatest of
-                        Just latest
-                            | latest == version ->
+                    case mlatestApplicable of
+                        Just la
+                            | la == version ->
                                 versionString version ++
-                                " found (latest version available)"
-                        _ -> versionString version ++ " found" ++ latestStr
+                                " found (latest applicable version available)"
+                        _ -> versionString version ++ " found" ++ latestApplicableStr
         ]
          {- TODO Perhaps change the showDep function to look more like this:
           dropQuotes = filter ((/=) '\"')
@@ -408,118 +413,6 @@ instance Show ConstructPlanException where
 
 ----------------------------------------------
 
--- | Which subset of packages to build
-data BuildSubset
-    = BSAll
-    | BSOnlySnapshot
-    -- ^ Only install packages in the snapshot database, skipping
-    -- packages intended for the local database.
-    | BSOnlyDependencies
-    deriving (Show, Eq)
-
--- | Configuration for building.
-data BuildOpts =
-  BuildOpts {boptsTargets :: ![Text]
-            ,boptsLibProfile :: !Bool
-            ,boptsExeProfile :: !Bool
-            ,boptsHaddock :: !Bool
-            -- ^ Build haddocks?
-            ,boptsHaddockDeps :: !(Maybe Bool)
-            -- ^ Build haddocks for dependencies?
-            ,boptsDryrun :: !Bool
-            ,boptsGhcOptions :: ![Text]
-            ,boptsFlags :: !(Map (Maybe PackageName) (Map FlagName Bool))
-            ,boptsInstallExes :: !Bool
-            -- ^ Install executables to user path after building?
-            ,boptsPreFetch :: !Bool
-            -- ^ Fetch all packages immediately
-            ,boptsBuildSubset :: !BuildSubset
-            ,boptsFileWatch :: !FileWatchOpts
-            -- ^ Watch files for changes and automatically rebuild
-            ,boptsKeepGoing :: !(Maybe Bool)
-            -- ^ Keep building/running after failure
-            ,boptsForceDirty :: !Bool
-            -- ^ Force treating all local packages as having dirty files
-
-            ,boptsTests :: !Bool
-            -- ^ Turn on tests for local targets
-            ,boptsTestOpts :: !TestOpts
-            -- ^ Additional test arguments
-
-            ,boptsBenchmarks :: !Bool
-            -- ^ Turn on benchmarks for local targets
-            ,boptsBenchmarkOpts :: !BenchmarkOpts
-            -- ^ Additional test arguments
-            ,boptsExec :: ![(String, [String])]
-            -- ^ Commands (with arguments) to run after a successful build
-            ,boptsOnlyConfigure :: !Bool
-            -- ^ Only perform the configure step when building
-            ,boptsReconfigure :: !Bool
-            -- ^ Perform the configure step even if already configured
-            ,boptsCabalVerbose :: !Bool
-            -- ^ Ask Cabal to be verbose in its builds
-            }
-  deriving (Show)
-
-defaultBuildOpts :: BuildOpts
-defaultBuildOpts = BuildOpts
-    { boptsTargets = []
-    , boptsLibProfile = False
-    , boptsExeProfile = False
-    , boptsHaddock = False
-    , boptsHaddockDeps = Nothing
-    , boptsDryrun = False
-    , boptsGhcOptions = []
-    , boptsFlags = Map.empty
-    , boptsInstallExes = False
-    , boptsPreFetch = False
-    , boptsBuildSubset = BSAll
-    , boptsFileWatch = NoFileWatch
-    , boptsKeepGoing = Nothing
-    , boptsForceDirty = False
-    , boptsTests = False
-    , boptsTestOpts = defaultTestOpts
-    , boptsBenchmarks = False
-    , boptsBenchmarkOpts = defaultBenchmarkOpts
-    , boptsExec = []
-    , boptsOnlyConfigure = False
-    , boptsReconfigure = False
-    , boptsCabalVerbose = False
-    }
-
--- | Options for the 'FinalAction' 'DoTests'
-data TestOpts =
-  TestOpts {toRerunTests :: !Bool -- ^ Whether successful tests will be run gain
-           ,toAdditionalArgs :: ![String] -- ^ Arguments passed to the test program
-           ,toCoverage :: !Bool -- ^ Generate a code coverage report
-           ,toDisableRun :: !Bool -- ^ Disable running of tests
-           } deriving (Eq,Show)
-
-defaultTestOpts :: TestOpts
-defaultTestOpts = TestOpts
-    { toRerunTests = True
-    , toAdditionalArgs = []
-    , toCoverage = False
-    , toDisableRun = False
-    }
-
--- | Options for the 'FinalAction' 'DoBenchmarks'
-data BenchmarkOpts =
-  BenchmarkOpts {beoAdditionalArgs :: !(Maybe String) -- ^ Arguments passed to the benchmark program
-                ,beoDisableRun :: !Bool -- ^ Disable running of benchmarks
-                } deriving (Eq,Show)
-
-defaultBenchmarkOpts :: BenchmarkOpts
-defaultBenchmarkOpts = BenchmarkOpts
-    { beoAdditionalArgs = Nothing
-    , beoDisableRun = False
-    }
-
-data FileWatchOpts
-  = NoFileWatch
-  | FileWatch
-  | FileWatchPoll
-  deriving (Show,Eq)
 
 -- | Package dependency oracle.
 newtype PkgDepsOracle =
@@ -622,6 +515,7 @@ data BaseConfigOpts = BaseConfigOpts
     , bcoSnapInstallRoot :: !(Path Abs Dir)
     , bcoLocalInstallRoot :: !(Path Abs Dir)
     , bcoBuildOpts :: !BuildOpts
+    , bcoBuildOptsCLI :: !BuildOptsCLI
     , bcoExtraDBs :: ![(Path Abs Dir)]
     }
 
@@ -700,6 +594,7 @@ configureOptsNoDir econfig bco deps wanted isLocal package = concat
   where
     config = getConfig econfig
     bopts = bcoBuildOpts bco
+    boptsCli = bcoBuildOptsCLI bco
 
     depOptions = map (uncurry toDepOption) $ Map.toList deps
       where
@@ -727,8 +622,12 @@ configureOptsNoDir econfig bco deps wanted isLocal package = concat
     allGhcOptions = concat
         [ Map.findWithDefault [] Nothing (configGhcOptions config)
         , Map.findWithDefault [] (Just $ packageName package) (configGhcOptions config)
+        , concat [["-fhpc"] | isLocal && toCoverage (boptsTestOpts bopts)]
+        , if (boptsLibProfile bopts || boptsExeProfile bopts)
+             then ["-auto-all","-caf-all"]
+             else []
         , if includeExtraOptions
-            then boptsGhcOptions bopts
+            then boptsCLIGhcOptions boptsCli
             else []
         ]
 

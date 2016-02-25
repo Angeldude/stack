@@ -89,8 +89,8 @@ instance (MonadIO m) => MonadLogger (StackT config m) where
 -- | Run a Stack action, using global options.
 runStackTGlobal :: (MonadIO m,MonadBaseControl IO m)
                 => Manager -> config -> GlobalOpts -> StackT config m a -> m a
-runStackTGlobal manager config GlobalOpts{..} m =
-    runStackT manager globalLogLevel config globalTerminal (isJust globalReExecVersion) m
+runStackTGlobal manager config GlobalOpts{..} =
+    runStackT manager globalLogLevel config globalTerminal (isJust globalReExecVersion)
 
 -- | Run a Stack action.
 runStackT :: (MonadIO m,MonadBaseControl IO m)
@@ -188,8 +188,8 @@ runInnerStackLoggingT inner = do
 -- | Run the logging monad, using global options.
 runStackLoggingTGlobal :: MonadIO m
                        => Manager -> GlobalOpts -> StackLoggingT m a -> m a
-runStackLoggingTGlobal manager GlobalOpts{..} m =
-    runStackLoggingT manager globalLogLevel globalTerminal (isJust globalReExecVersion) m
+runStackLoggingTGlobal manager GlobalOpts{..} =
+    runStackLoggingT manager globalLogLevel globalTerminal (isJust globalReExecVersion)
 
 -- | Run the logging monad.
 runStackLoggingT :: MonadIO m
@@ -223,6 +223,7 @@ stickyLoggerFunc loc src level msg = do
     case mref of
         Nothing ->
             loggerFunc
+                out
                 loc
                 src
                 (case level of
@@ -239,7 +240,7 @@ stickyLoggerFunc loc src level msg = do
                         (maybe 0 T.length sticky)
                 clear =
                     liftIO
-                        (S8.putStr
+                        (S8.hPutStr out
                              (repeating backSpaceChar <>
                               repeating ' ' <>
                               repeating backSpaceChar))
@@ -255,26 +256,27 @@ stickyLoggerFunc loc src level msg = do
                 case level of
                     LevelOther "sticky-done" -> do
                         clear
-                        liftIO (T.putStrLn msgText)
+                        liftIO (T.hPutStrLn out msgText >> hFlush out)
                         return Nothing
                     LevelOther "sticky" -> do
                         clear
-                        liftIO (T.putStr msgText)
+                        liftIO (T.hPutStr out msgText >> hFlush out)
                         return (Just msgText)
                     _
                       | level >= maxLogLevel -> do
                           clear
-                          loggerFunc loc src level $ toLogStr msgText
+                          loggerFunc out loc src level $ toLogStr msgText
                           case sticky of
                               Nothing ->
                                   return Nothing
                               Just line -> do
-                                  liftIO (T.putStr line)
+                                  liftIO (T.hPutStr out line >> hFlush out)
                                   return sticky
                       | otherwise ->
                           return sticky
             liftIO (putMVar ref newState)
   where
+    out = stderr
     msgTextRaw = T.decodeUtf8With T.lenientDecode msgBytes
     msgBytes = fromLogStr (toLogStr msg)
 
@@ -286,14 +288,13 @@ replaceUnicode c = c
 
 -- | Logging function takes the log level into account.
 loggerFunc :: (MonadIO m,ToLogStr msg,MonadReader r m,HasLogLevel r)
-           => Loc -> Text -> LogLevel -> msg -> m ()
-loggerFunc loc _src level msg =
+           => Handle -> Loc -> Text -> LogLevel -> msg -> m ()
+loggerFunc outputChannel loc _src level msg =
   do maxLogLevel <- asks getLogLevel
      when (level >= maxLogLevel)
           (liftIO (do out <- getOutput maxLogLevel
                       T.hPutStrLn outputChannel out))
-  where outputChannel = stderr
-        getOutput maxLogLevel =
+  where getOutput maxLogLevel =
           do timestamp <- getTimestamp
              l <- getLevel
              lc <- getLoc
@@ -317,15 +318,15 @@ loggerFunc loc _src level msg =
                     return (" @(" ++ fileLocStr ++ ")")
                   | otherwise = return ""
                 fileLocStr =
-                  (loc_package loc) ++
+                  loc_package loc ++
                   ':' :
-                  (loc_module loc) ++
+                  loc_module loc ++
                   ' ' :
-                  (loc_filename loc) ++
+                  loc_filename loc ++
                   ':' :
-                  (line loc) ++
+                  line loc ++
                   ':' :
-                  (char loc)
+                  char loc
                   where line = show . fst . loc_start
                         char = show . snd . loc_start
 

@@ -6,6 +6,7 @@ module Stack.PackageDumpSpec where
 import Data.Conduit
 import qualified Data.Conduit.List as CL
 import qualified Data.Conduit.Binary as CB
+import           Data.Conduit.Text (decodeUtf8)
 import Control.Monad.Trans.Resource (runResourceT)
 import Stack.PackageDump
 import Stack.Types
@@ -63,6 +64,7 @@ spec = do
         it "ghc 7.8" $ do
             haskell2010:_ <- runResourceT
                 $ CB.sourceFile "test/package-dump/ghc-7.8.txt"
+              =$= decodeUtf8
                $$ conduitDumpPackage
                =$ CL.consume
             ghcPkgId <- parseGhcPkgId "haskell2010-1.1.2.0-05c8dd51009e08c6371c82972d40f55a"
@@ -89,6 +91,7 @@ spec = do
         it "ghc 7.10" $ do
             haskell2010:_ <- runResourceT
                 $ CB.sourceFile "test/package-dump/ghc-7.10.txt"
+              =$= decodeUtf8
                $$ conduitDumpPackage
                =$ CL.consume
             ghcPkgId <- parseGhcPkgId "ghc-7.10.1-325809317787a897b7a97d646ceaa3a3"
@@ -125,6 +128,7 @@ spec = do
         it "ghc 7.8.4 (osx)" $ do
             hmatrix:_ <- runResourceT
                 $ CB.sourceFile "test/package-dump/ghc-7.8.4-osx.txt"
+              =$= decodeUtf8
                $$ conduitDumpPackage
                =$ CL.consume
             ghcPkgId <- parseGhcPkgId "hmatrix-0.16.1.5-12d5d21f26aa98774cdd8edbc343fbfe"
@@ -156,6 +160,36 @@ spec = do
                 , dpHaddock = ()
                 , dpIsExposed = True
                 }
+        it "ghc HEAD" $ do
+          ghcBoot:_ <- runResourceT
+              $ CB.sourceFile "test/package-dump/ghc-head.txt"
+            =$= decodeUtf8
+             $$ conduitDumpPackage
+             =$ CL.consume
+          ghcPkgId <- parseGhcPkgId "ghc-boot-0.0.0.0"
+          pkgId <- parsePackageIdentifier "ghc-boot-0.0.0.0"
+          depends <- mapM parseGhcPkgId
+            [ "base-4.9.0.0"
+            , "binary-0.7.5.0"
+            , "bytestring-0.10.7.0"
+            , "directory-1.2.5.0"
+            , "filepath-1.4.1.0"
+            ]
+          ghcBoot `shouldBe` DumpPackage
+            { dpGhcPkgId = ghcPkgId
+            , dpPackageIdent = pkgId
+            , dpLibDirs =
+                  ["/opt/ghc/head/lib/ghc-7.11.20151213/ghc-boot-0.0.0.0"]
+            , dpHaddockInterfaces = ["/opt/ghc/head/share/doc/ghc/html/libraries/ghc-boot-0.0.0.0/ghc-boot.haddock"]
+            , dpHaddockHtml = Just "/opt/ghc/head/share/doc/ghc/html/libraries/ghc-boot-0.0.0.0"
+            , dpDepends = depends
+            , dpLibraries = ["HSghc-boot-0.0.0.0"]
+            , dpHasExposedModules = True
+            , dpProfiling = ()
+            , dpHaddock = ()
+            , dpIsExposed = True
+            }
+
 
     it "ghcPkgDump + addProfiling + addHaddock" $ (id :: IO () -> IO ()) $ runNoLoggingT $ do
         menv' <- getEnvOverride buildPlatform

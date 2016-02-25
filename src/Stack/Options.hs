@@ -1,7 +1,9 @@
-{-# LANGUAGE OverloadedStrings,RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
 
 module Stack.Options
-    (Command(..)
+    (BuildCommand(..)
+    ,GlobalOptsContext(..)
     ,benchOptsParser
     ,buildOptsParser
     ,cleanOptsParser
@@ -15,6 +17,7 @@ module Stack.Options
     ,globalOptsParser
     ,initOptsParser
     ,newOptsParser
+    ,nixOptsParser
     ,logLevelOptsParser
     ,ghciOptsParser
     ,solverOptsParser
@@ -24,184 +27,135 @@ module Stack.Options
     ,globalOptsFromMonoid
     ) where
 
-import           Control.Monad.Logger (LogLevel(..))
-import           Data.Char (isSpace, toLower)
-import           Data.List (intercalate)
-import           Data.List.Split (splitOn)
-import qualified Data.Map as Map
-import           Data.Map.Strict (Map)
-import qualified Data.Map.Strict as M
+import           Control.Monad.Logger              (LogLevel (..))
+import           Data.Char                         (isSpace, toLower)
+import           Data.List                         (intercalate)
+import           Data.List.Split                   (splitOn)
+import qualified Data.Map                          as Map
+import           Data.Map.Strict                   (Map)
+import qualified Data.Map.Strict                   as M
 import           Data.Maybe
 import           Data.Monoid
-import qualified Data.Set as Set
-import qualified Data.Text as T
-import           Data.Text.Read (decimal)
-import           Distribution.Version (anyVersion)
+import qualified Data.Set                          as Set
+import qualified Data.Text                         as T
+import           Data.Text.Read                    (decimal)
+import           Distribution.Version              (anyVersion)
 import           Options.Applicative
 import           Options.Applicative.Args
 import           Options.Applicative.Builder.Extra
-import           Options.Applicative.Types (fromM, oneM, readerAsk)
-import           Stack.Clean (CleanOpts(..))
-import           Stack.Config (packagesParser)
+import           Options.Applicative.Types         (fromM, oneM, readerAsk)
+import           Stack.Clean                       (CleanOpts (..))
+import           Stack.Config                      (packagesParser)
 import           Stack.ConfigCmd
-import           Stack.Constants (stackProgName)
-import           Stack.Coverage (HpcReportOpts(..))
+import           Stack.Constants                   (stackProgName)
+import           Stack.Coverage                    (HpcReportOpts (..))
 import           Stack.Docker
-import qualified Stack.Docker as Docker
+import qualified Stack.Docker                      as Docker
 import           Stack.Dot
-import           Stack.Ghci (GhciOpts(..))
+import           Stack.Ghci                        (GhciOpts (..))
 import           Stack.Init
 import           Stack.New
+import           Stack.Nix
 import           Stack.Types
 import           Stack.Types.TemplateName
 
--- | Command sum type for conditional arguments.
-data Command
-    = Build
-    | Test
-    | Haddock
-    | Bench
-    | Install
-    deriving (Eq)
+-- | Allows adjust global options depending on their context
+-- Note: This was being used to remove ambibuity between the local and global
+-- implementation of stack init --resolver option. Now that stack init has no
+-- local --resolver this is not being used anymore but the code is kept for any
+-- similar future use cases.
+data GlobalOptsContext
+    = OuterGlobalOpts -- ^ Global options before subcommand name
+    | OtherCmdGlobalOpts -- ^ Global options following any other subcommand
+    deriving (Show, Eq)
 
 -- | Parser for bench arguments.
-benchOptsParser :: Parser BenchmarkOpts
-benchOptsParser = BenchmarkOpts
+-- FIXME hiding options
+benchOptsParser :: Bool -> Parser BenchmarkOptsMonoid
+benchOptsParser hide0 = BenchmarkOptsMonoid
         <$> optional (strOption (long "benchmark-arguments" <>
                                  metavar "BENCH_ARGS" <>
                                  help ("Forward BENCH_ARGS to the benchmark suite. " <>
-                                       "Supports templates from `cabal bench`")))
-        <*> switch (long "no-run-benchmarks" <>
-                   help "Disable running of benchmarks. (Benchmarks will still be built.)")
+                                       "Supports templates from `cabal bench`") <>
+                                 hide))
+        <*> optional (switch (long "no-run-benchmarks" <>
+                          help "Disable running of benchmarks. (Benchmarks will still be built.)" <>
+                             hide))
+   where hide = hideMods hide0
 
-addCoverageFlags :: BuildOpts -> BuildOpts
-addCoverageFlags bopts
-    | toCoverage $ boptsTestOpts bopts
-        = bopts { boptsGhcOptions = "-fhpc" : boptsGhcOptions bopts }
-    | otherwise = bopts
-
--- | Parser for build arguments.
-buildOptsParser :: Command
-                -> Parser BuildOpts
+-- | Parser for CLI-only build arguments
+buildOptsParser :: BuildCommand
+                -> Parser BuildOptsCLI
 buildOptsParser cmd =
-            fmap addCoverageFlags $
-            BuildOpts <$> target <*> libProfiling <*> exeProfiling <*>
-            haddock <*> haddockDeps <*> dryRun <*> ghcOpts <*>
-            flags <*> copyBins <*> preFetch <*> buildSubset <*>
-            fileWatch' <*> keepGoing <*> forceDirty <*> tests <*>
-            testOptsParser <*> benches <*> benchOptsParser <*>
-            many exec <*> onlyConfigure <*> reconfigure <*> cabalVerbose
-  where target =
-           many (textArgument
-                   (metavar "TARGET" <>
-                    help "If none specified, use all packages"))
-        libProfiling =
-          boolFlags False
-                    "library-profiling"
-                    "library profiling for TARGETs and all its dependencies"
-                    idm
-        exeProfiling =
-          boolFlags False
-                    "executable-profiling"
-                    "executable profiling for TARGETs and all its dependencies"
-                    idm
-        haddock =
-          boolFlags (cmd == Haddock)
-                    "haddock"
-                    "generating Haddocks the package(s) in this directory/configuration"
-                    idm
-        haddockDeps =
-             maybeBoolFlags
-                       "haddock-deps"
-                       "building Haddocks for dependencies"
-                       idm
-        copyBins = boolFlags (cmd == Install)
-            "copy-bins"
-            "copying binaries to the local-bin-path (see 'stack path')"
-            idm
-
-        dryRun = switch (long "dry-run" <>
-                         help "Don't build anything, just prepare to")
-        ghcOpts = (\x y z -> concat [x, y, z])
-          <$> flag [] ["-Wall", "-Werror"]
-              ( long "pedantic"
-             <> help "Turn on -Wall and -Werror"
-              )
-          <*> flag [] ["-O0"]
-              ( long "fast"
-             <> help "Turn off optimizations (-O0)"
-              )
-          <*> many (textOption (long "ghc-options" <>
-                                metavar "OPTION" <>
-                                help "Additional options passed to GHC"))
-
-        flags = Map.unionsWith Map.union <$> many
-                  (option readFlag
-                      (long "flag" <>
-                       metavar "PACKAGE:[-]FLAG" <>
-                       help ("Override flags set in stack.yaml " <>
-                             "(applies to local packages and extra-deps)")))
-
-        preFetch = switch
-            (long "prefetch" <>
-             help "Fetch packages necessary for the build immediately, useful with --dry-run")
-
-        buildSubset =
-            flag' BSOnlyDependencies
-                (long "dependencies-only" <>
-                 help "A synonym for --only-dependencies")
-            <|> flag' BSOnlySnapshot
-                (long ("only-snapshot") <>
-                 help ("Only build packages for the snapshot database, not the local database"))
-            <|> flag' BSOnlyDependencies
-                (long ("only-dependencies") <>
-                 help ("Only build packages that are dependencies of targets on the command line"))
-            <|> pure BSAll
-
-        fileWatch' =
-            flag' FileWatch
-                (long "file-watch" <>
-                 help "Watch for changes in local files and automatically rebuild. Ignores files in VCS boring/ignore file")
-            <|> flag' FileWatchPoll
-                (long "file-watch-poll" <>
-                 help "Like --file-watch, but polling the filesystem instead of using events")
-            <|> pure NoFileWatch
-
-        keepGoing = maybeBoolFlags
-            "keep-going"
-            "continue running after a step fails (default: false for build, true for test/bench)"
-            idm
-
-        forceDirty = switch
-            (long "force-dirty" <>
-             help "Force treating all local packages as having dirty files (useful for cases where stack can't detect a file change)")
-
-        tests = boolFlags (cmd == Test)
-            "test"
-            "testing the package(s) in this directory/configuration"
-            idm
-
-        benches = boolFlags (cmd == Bench)
-            "bench"
-            "benchmarking the package(s) in this directory/configuration"
-            idm
-
-        exec = cmdOption
-            ( long "exec" <>
+    BuildOptsCLI <$>
+    many
+        (textArgument
+             (metavar "TARGET" <>
+              help "If none specified, use all packages")) <*>
+    switch
+        (long "dry-run" <>
+         help "Don't build anything, just prepare to") <*>
+    ((\x y z ->
+           concat [x, y, z]) <$>
+     flag
+         []
+         ["-Wall", "-Werror"]
+         (long "pedantic" <>
+          help "Turn on -Wall and -Werror") <*>
+     flag
+         []
+         ["-O0"]
+         (long "fast" <>
+          help "Turn off optimizations (-O0)") <*>
+     many
+         (textOption
+              (long "ghc-options" <>
+               metavar "OPTION" <>
+               help "Additional options passed to GHC"))) <*>
+    (Map.unionsWith Map.union <$>
+     many
+         (option
+              readFlag
+              (long "flag" <>
+               metavar "PACKAGE:[-]FLAG" <>
+               help
+                   ("Override flags set in stack.yaml " <>
+                    "(applies to local packages and extra-deps)")))) <*>
+    (flag'
+         BSOnlyDependencies
+         (long "dependencies-only" <>
+          help "A synonym for --only-dependencies") <|>
+     flag'
+         BSOnlySnapshot
+         (long "only-snapshot" <>
+          help
+              "Only build packages for the snapshot database, not the local database") <|>
+     flag'
+         BSOnlyDependencies
+         (long "only-dependencies" <>
+          help
+              "Only build packages that are dependencies of targets on the command line") <|>
+     pure BSAll) <*>
+    (flag'
+         FileWatch
+         (long "file-watch" <>
+          help
+              "Watch for changes in local files and automatically rebuild. Ignores files in VCS boring/ignore file") <|>
+     flag'
+         FileWatchPoll
+         (long "file-watch-poll" <>
+          help
+              "Like --file-watch, but polling the filesystem instead of using events") <|>
+     pure NoFileWatch) <*>
+    many (cmdOption
+             (long "exec" <>
               metavar "CMD [ARGS]" <>
-              help "Command and arguments to run after a successful build" )
-
-        onlyConfigure = switch
-            (long "only-configure" <>
-             help "Only perform the configure step, not any builds. Intended for tool usage, may break when used on multiple packages at once!")
-
-        reconfigure = switch
-            (long "reconfigure" <>
-             help "Perform the configure step even if unnecessary. Useful in some corner cases with custom Setup.hs files")
-
-        cabalVerbose = switch
-            (long "cabal-verbose" <>
-             help "Ask Cabal to be verbose in its output")
+              help "Command and arguments to run after a successful build")) <*>
+    switch
+        (long "only-configure" <>
+         help
+             "Only perform the configure step, not any builds. Intended for tool usage, may break when used on multiple packages at once!") <*>
+    pure cmd
 
 -- | Parser for package:[-]flag
 readFlag :: ReadM (Map (Maybe PackageName) (Map FlagName Bool))
@@ -228,19 +182,26 @@ readFlag = do
 
 -- | Command-line parser for the clean command.
 cleanOptsParser :: Parser CleanOpts
-cleanOptsParser = CleanOpts <$> packages
+cleanOptsParser = CleanTargets <$> packages <|> CleanFull <$> doFullClean
   where
     packages =
         many
             (packageNameArgument
                  (metavar "PACKAGE" <>
                   help "If none specified, clean all local packages"))
+    doFullClean =
+        switch
+            (long "full" <>
+             help "Remove whole the work dir, default is .stack-work")
 
 -- | Command-line arguments parser for configuration.
 configOptsParser :: Bool -> Parser ConfigMonoid
 configOptsParser hide0 =
-    (\opts systemGHC installGHC arch os ghcVariant jobs includes libs skipGHCCheck skipMsys localBin modifyCodePage -> mempty
-        { configMonoidDockerOpts = opts
+    (\workDir buildOpts dockerOpts nixOpts systemGHC installGHC arch os ghcVariant jobs includes libs skipGHCCheck skipMsys localBin modifyCodePage allowDifferentUser -> mempty
+        { configMonoidWorkDir = workDir
+        , configMonoidBuildOpts = buildOpts
+        , configMonoidDockerOpts = dockerOpts
+        , configMonoidNixOpts = nixOpts
         , configMonoidSystemGHC = systemGHC
         , configMonoidInstallGHC = installGHC
         , configMonoidSkipGHCCheck = skipGHCCheck
@@ -253,8 +214,17 @@ configOptsParser hide0 =
         , configMonoidSkipMsys = skipMsys
         , configMonoidLocalBinPath = localBin
         , configMonoidModifyCodePage = modifyCodePage
+        , configMonoidAllowDifferentUser = allowDifferentUser
         })
-    <$> dockerOptsParser True
+    <$> optional (strOption
+            ( long "work-dir"
+            <> metavar "WORK-DIR"
+            <> help "Override work directory (default: .stack-work)"
+            <> hide
+            ))
+    <*> buildOptsMonoidParser True
+    <*> dockerOptsParser True
+    <*> nixOptsParser True
     <*> maybeBoolFlags
             "system-ghc"
             "using the system installed GHC (on the PATH) if available and a matching version"
@@ -313,7 +283,172 @@ configOptsParser hide0 =
             "modify-code-page"
             "setting the codepage to support UTF-8 (Windows only)"
             hide
+    <*> maybeBoolFlags
+            "allow-different-user"
+            ("permission for users other than the owner of the stack root " ++
+                "directory to use a stack installation (POSIX only)")
+            hide
   where hide = hideMods hide0
+
+buildOptsMonoidParser :: Bool -> Parser BuildOptsMonoid
+buildOptsMonoidParser hide0 =
+    transform <$> trace <*> profile <*> options
+  where
+    hide =
+        hideMods hide0
+    transform tracing profiling =
+        enable
+      where
+        enable opts
+          | tracing || profiling =
+              opts
+              { buildMonoidLibProfile = Just True
+              , buildMonoidExeProfile = Just True
+              , buildMonoidBenchmarkOpts = bopts
+                { beoMonoidAdditionalArgs = beoMonoidAdditionalArgs bopts <>
+                  Just (" " <> unwords additionalArgs)
+                }
+              , buildMonoidTestOpts = topts
+                { toMonoidAdditionalArgs = (toMonoidAdditionalArgs topts) <>
+                  additionalArgs
+                }
+              }
+          | otherwise =
+              opts
+          where
+            bopts =
+                buildMonoidBenchmarkOpts opts
+            topts =
+                buildMonoidTestOpts opts
+            additionalArgs =
+                "+RTS" : catMaybes [trac, prof, Just "-RTS"]
+            trac =
+                if tracing
+                    then Just "-xc"
+                    else Nothing
+            prof =
+                if profiling
+                    then Just "-p"
+                    else Nothing
+    profile =
+        flag
+            False
+            True
+            (long "profile" <>
+             help
+                 "Enable profiling in libraries, executables, etc. \
+                    \for all expressions and generate a profiling report\
+                    \ in exec or benchmarks" <>
+            hide)
+
+    trace =
+        flag
+            False
+            True
+            (long "trace" <>
+             help
+                 "Enable profiling in libraries, executables, etc. \
+                    \for all expressions and generate a backtrace on \
+                    \exception" <>
+            hide)
+    options =
+        BuildOptsMonoid <$> libProfiling <*> exeProfiling <*> haddock <*>
+        haddockDeps <*> copyBins <*> preFetch <*> keepGoing <*> forceDirty <*>
+        tests <*> testOptsParser hide0 <*> benches <*> benchOptsParser hide0 <*> reconfigure <*>
+        cabalVerbose
+    libProfiling =
+        maybeBoolFlags
+            "library-profiling"
+            "library profiling for TARGETs and all its dependencies"
+            hide
+    exeProfiling =
+        maybeBoolFlags
+            "executable-profiling"
+            "executable profiling for TARGETs and all its dependencies"
+            hide
+    haddock =
+        maybeBoolFlags
+            "haddock"
+            "generating Haddocks the package(s) in this directory/configuration"
+            hide
+    haddockDeps =
+        maybeBoolFlags "haddock-deps" "building Haddocks for dependencies" hide
+    copyBins =
+        maybeBoolFlags
+            "copy-bins"
+            "copying binaries to the local-bin-path (see 'stack path')"
+            hide
+    keepGoing =
+        maybeBoolFlags
+            "keep-going"
+            "continue running after a step fails (default: false for build, true for test/bench)"
+            hide
+    preFetch =
+        maybeBoolFlags
+            "prefetch"
+             "Fetch packages necessary for the build immediately, useful with --dry-run"
+             hide
+    forceDirty =
+        maybeBoolFlags
+            "force-dirty"
+            "Force treating all local packages as having dirty files (useful for cases where stack can't detect a file change"
+            hide
+    tests =
+        maybeBoolFlags
+            "test"
+            "testing the package(s) in this directory/configuration"
+            hide
+    benches =
+        maybeBoolFlags
+            "bench"
+            "benchmarking the package(s) in this directory/configuration"
+            hide
+    reconfigure =
+        maybeBoolFlags
+             "reconfigure"
+             "Perform the configure step even if unnecessary. Useful in some corner cases with custom Setup.hs files"
+            hide
+    cabalVerbose =
+        maybeBoolFlags
+            "cabal-verbose"
+            "Ask Cabal to be verbose in its output"
+            hide
+
+nixOptsParser :: Bool -> Parser NixOptsMonoid
+nixOptsParser hide0 = overrideActivation <$>
+  (NixOptsMonoid
+  <$> pure False
+  <*> maybeBoolFlags nixCmdName
+                     "use of a Nix-shell"
+                     hide
+  <*> maybeBoolFlags "nix-pure"
+                     "use of a pure Nix-shell"
+                     hide
+  <*> (fmap (map T.pack)
+       <$> optional (argsOption (long "nix-packages" <>
+                                 metavar "NAMES" <>
+                                 help "List of packages that should be available in the nix-shell (space separated)" <>
+                                 hide)))
+  <*> optional (option str (long "nix-shell-file" <>
+                            metavar "FILEPATH" <>
+                            help "Nix file to be used to launch a nix-shell (for regular Nix users)" <>
+                            hide))
+  <*> (fmap (map T.pack)
+       <$> optional (argsOption (long "nix-shell-options" <>
+                                 metavar "OPTIONS" <>
+                                 help "Additional options passed to nix-shell" <>
+                                 hide)))
+  <*> (fmap (map T.pack)
+       <$> optional (argsOption (long "nix-path" <>
+                                 metavar "PATH_OPTIONS" <>
+                                 help "Additional options to override NIX_PATH parts (notably 'nixpkgs')" <>
+                                 hide)))
+  )
+  where
+    hide = hideMods hide0
+    overrideActivation m =
+      if m /= mempty then m { nixMonoidEnable = Just . fromMaybe True $ nixMonoidEnable m }
+      else m
 
 -- | Options parser configuration for Docker.
 dockerOptsParser :: Bool -> Parser DockerOptsMonoid
@@ -375,7 +510,7 @@ dockerOptsParser hide0 =
                         hide <>
                         metavar "PATH" <>
                         help "Location of image usage tracking database")
-    <*> optional (option str
+    <*> maybeStrOption
             (long(dockerOptName dockerStackExeArgName) <>
              hide <>
              metavar (intercalate "|"
@@ -385,7 +520,7 @@ dockerOptsParser hide0 =
                           , "PATH" ]) <>
              help (concat [ "Location of "
                           , stackProgName
-                          , " executable used in container" ])))
+                          , " executable used in container" ]))
     <*> maybeBoolFlags (dockerOptName dockerSetUserArgName)
                        "setting user in container to match host"
                        hide
@@ -490,6 +625,9 @@ ghciOptsParser = GhciOpts
                             help "Specify which target should contain the main \
                                  \module to load, such as for an executable for \
                                  \test suite or benchmark."))
+             <*> switch (long "load-local-deps" <> help "Load all local dependencies of your targets")
+             <*> switch (long "skip-intermediate-deps" <> help "Skip loading intermediate target dependencies")
+             <*> boolFlags True "package-hiding" "package hiding" idm
              <*> buildOptsParser Build
 
 -- | Parser for exec command
@@ -542,12 +680,12 @@ execOptsExtraParser = eoPlainParser <|>
                            help "Use an unmodified environment (only useful with Docker)")
 
 -- | Parser for global command-line options.
-globalOptsParser :: Bool -> Parser GlobalOptsMonoid
-globalOptsParser hide0 =
+globalOptsParser :: GlobalOptsContext -> Maybe LogLevel -> Parser GlobalOptsMonoid
+globalOptsParser kind defLogLevel =
     GlobalOptsMonoid <$>
     optional (strOption (long Docker.reExecArgName <> hidden <> internal)) <*>
     optional (option auto (long dockerEntrypointArgName <> hidden <> internal)) <*>
-    logLevelOptsParser hide0 <*>
+    logLevelOptsParser hide0 defLogLevel <*>
     configOptsParser hide0 <*>
     optional (abstractResolverOptsParser hide0) <*>
     optional (compilerOptsParser hide0) <*>
@@ -560,54 +698,44 @@ globalOptsParser hide0 =
                          help ("Override project stack.yaml file " <>
                                "(overrides any STACK_YAML environment variable)") <>
                          hide))
-  where hide = hideMods hide0
+  where
+    hide = hideMods hide0
+    hide0 = kind /= OuterGlobalOpts
 
 -- | Create GlobalOpts from GlobalOptsMonoid.
 globalOptsFromMonoid :: Bool -> GlobalOptsMonoid -> GlobalOpts
 globalOptsFromMonoid defaultTerminal GlobalOptsMonoid{..} = GlobalOpts
     { globalReExecVersion = globalMonoidReExecVersion
     , globalDockerEntrypoint = globalMonoidDockerEntrypoint
-    , globalLogLevel = fromMaybe defaultLogLevel (globalMonoidLogLevel)
+    , globalLogLevel = fromMaybe defaultLogLevel globalMonoidLogLevel
     , globalConfigMonoid = globalMonoidConfigMonoid
     , globalResolver = globalMonoidResolver
     , globalCompiler = globalMonoidCompiler
-    , globalTerminal = fromMaybe defaultTerminal (globalMonoidTerminal)
+    , globalTerminal = fromMaybe defaultTerminal globalMonoidTerminal
     , globalStackYaml = globalMonoidStackYaml }
 
 initOptsParser :: Parser InitOpts
 initOptsParser =
-    InitOpts <$> method <*> overwrite <*> fmap not ignoreSubDirs
+    InitOpts <$> searchDirs
+             <*> solver <*> omitPackages
+             <*> overwrite <*> fmap not ignoreSubDirs
   where
+    searchDirs =
+      many (textArgument
+              (metavar "DIRS" <>
+               help "Directories to include, default is current directory."))
     ignoreSubDirs = switch (long "ignore-subdirs" <>
                            help "Do not search for .cabal files in sub directories")
     overwrite = switch (long "force" <>
-                       help "Force overwriting of an existing stack.yaml if it exists")
-    method = solver
-         <|> (MethodResolver <$> resolver)
-         <|> (MethodSnapshot <$> snapPref)
+                       help "Force overwriting an existing stack.yaml")
+    omitPackages = switch (long "omit-packages" <>
+                           help "Exclude conflicting or incompatible user packages")
+    solver = switch (long "solver" <>
+             help "Use a dependency solver to determine extra dependencies")
 
-    solver =
-        flag' MethodSolver
-            (long "solver" <>
-             help "Use a dependency solver to determine dependencies")
-
-    snapPref =
-        flag' PrefLTS
-            (long "prefer-lts" <>
-             help "Prefer LTS snapshots over Nightly snapshots") <|>
-        flag' PrefNightly
-            (long "prefer-nightly" <>
-             help "Prefer Nightly snapshots over LTS snapshots") <|>
-        pure PrefNone
-
-    resolver = option readAbstractResolver
-        (long "resolver" <>
-         metavar "RESOLVER" <>
-         help "Use the given resolver, even if not all dependencies are met")
-
--- | Parse for a logging level.
-logLevelOptsParser :: Bool -> Parser (Maybe LogLevel)
-logLevelOptsParser hide =
+-- | Parser for a logging level.
+logLevelOptsParser :: Bool -> Maybe LogLevel -> Parser (Maybe LogLevel)
+logLevelOptsParser hide defLogLevel =
   fmap (Just . parse)
        (strOption (long "verbosity" <>
                    metavar "VERBOSITY" <>
@@ -617,7 +745,7 @@ logLevelOptsParser hide =
        (short 'v' <> long "verbose" <>
         help ("Enable verbose mode: verbosity level \"" <> showLevel verboseLevel <> "\"") <>
         hideMods hide) <|>
-  pure Nothing
+  pure defLogLevel
   where verboseLevel = LevelDebug
         showLevel l =
           case l of
@@ -692,25 +820,30 @@ ghcVariantParser hide =
 -- | Parser for @solverCmd@
 solverOptsParser :: Parser Bool
 solverOptsParser = boolFlags False
-    "modify-stack-yaml"
-    "Automatically modify stack.yaml with the solver's recommendations"
+    "update-config"
+    "Automatically update stack.yaml with the solver's recommendations"
     idm
 
 -- | Parser for test arguments.
-testOptsParser :: Parser TestOpts
-testOptsParser = TestOpts
-       <$> boolFlags True
-                     "rerun-tests"
-                     "running already successful tests"
-                     idm
+-- FIXME hide args
+testOptsParser :: Bool -> Parser TestOptsMonoid
+testOptsParser hide0 = TestOptsMonoid
+       <$> maybeBoolFlags
+                          "rerun-tests"
+                          "running already successful tests"
+                          hide
        <*> fmap (fromMaybe [])
                 (optional (argsOption(long "test-arguments" <>
                                       metavar "TEST_ARGS" <>
-                                      help "Arguments passed in to the test suite program")))
-      <*> switch (long "coverage" <>
-                 help "Generate a code coverage report")
-      <*> switch (long "no-run-tests" <>
-                 help "Disable running of tests. (Tests will still be built.)")
+                                      help "Arguments passed in to the test suite program"
+                                     <> hide)))
+      <*> optional (switch (long "coverage" <>
+                          help "Generate a code coverage report"
+                          <> hide))
+      <*> optional (switch (long "no-run-tests" <>
+                          help "Disable running of tests. (Tests will still be built.)"
+                          <> hide))
+   where hide = hideMods hide0
 
 -- | Parser for @stack new@.
 newOptsParser :: Parser (NewOpts,InitOpts)
@@ -723,11 +856,11 @@ newOptsParser = (,) <$> newOpts <*> initOptsParser
         switch
             (long "bare" <>
              help "Do not create a subdirectory for the project") <*>
-        templateNameArgument
+        optional (templateNameArgument
             (metavar "TEMPLATE_NAME" <>
-             help "Name of a template or a local template in a subdirectory,\
-                  \ for example: foo or foo.hsfiles" <>
-             value defaultTemplateName) <*>
+             help "Name of a template or a local template in a file or a URL.\
+                  \ For example: foo or foo.hsfiles or ~/foo or\
+                  \ https://example.com/foo.hsfiles")) <*>
         fmap
             M.fromList
             (many

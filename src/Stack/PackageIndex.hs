@@ -13,6 +13,7 @@
 {-# LANGUAGE TemplateHaskell            #-}
 {-# LANGUAGE TupleSections              #-}
 {-# LANGUAGE ViewPatterns               #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
 
 -- | Dealing with the 00-index file and all its cabal files.
 module Stack.PackageIndex
@@ -34,10 +35,6 @@ import           Control.Monad.Trans.Control
 
 import           Data.Aeson.Extended
 import           Data.Binary.VersionTagged
-import qualified Data.Word8 as Word8
-import qualified Data.ByteString as S
-import qualified Data.ByteString.Unsafe as SU
-import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as L
 import           Data.Conduit (($$), (=$))
 import           Data.Conduit.Binary                   (sinkHandle,
@@ -50,11 +47,11 @@ import qualified Data.Map.Strict as Map
 import           Data.Monoid
 import           Data.Text (Text)
 import qualified Data.Text as T
+import           Data.Text.Unsafe (unsafeTail)
 
 import           Data.Traversable (forM)
 
 import           Data.Typeable (Typeable)
-
 
 import           Network.HTTP.Download
 import           Path                                  (mkRelDir, parent,
@@ -67,7 +64,8 @@ import           Stack.Types.StackT
 import           System.FilePath (takeBaseName, (<.>))
 import           System.IO                             (IOMode (ReadMode, WriteMode),
                                                         withBinaryFile)
-import           System.Process.Read (readInNull, EnvOverride, doesExecutableExist)
+import           System.Process.Read (readInNull, readProcessNull, ReadProcessException(..),
+                                      EnvOverride, doesExecutableExist)
 
 -- | Populate the package index caches and return them.
 populateCache
@@ -139,19 +137,19 @@ populateCache menv index = do
                     m
 
     breakSlash x
-        | S.null z = Nothing
-        | otherwise = Just (y, SU.unsafeTail z)
+        | T.null z = Nothing
+        | otherwise = Just (y, unsafeTail z)
       where
-        (y, z) = S.break (== Word8._slash) x
+        (y, z) = T.break (== '/') x
 
     parseNameVersion t1 = do
         (p', t3) <- breakSlash
-                  $ S.map (\c -> if c == Word8._backslash then Word8._slash else c)
-                  $ S8.pack t1
+                  $ T.map (\c -> if c == '\\' then '/' else c)
+                  $ T.pack t1
         p <- parsePackageName p'
         (v', t5) <- breakSlash t3
         v <- parseVersion v'
-        let (t6, suffix) = S.break (== Word8._period) t5
+        let (t6, suffix) = T.break (== '.') t5
         if t6 == p'
             then return (PackageIdentifier p v, suffix)
             else Nothing
@@ -178,20 +176,20 @@ instance Show PackageIndexException where
 
 -- | Require that an index be present, updating if it isn't.
 requireIndex :: (MonadIO m,MonadLogger m
-                ,MonadThrow m,MonadReader env m,HasHttpManager env
+                ,MonadReader env m,HasHttpManager env
                 ,HasConfig env,MonadBaseControl IO m,MonadCatch m)
              => EnvOverride
              -> PackageIndex
              -> m ()
 requireIndex menv index = do
     tarFile <- configPackageIndex $ indexName index
-    exists <- fileExists tarFile
+    exists <- doesFileExist tarFile
     unless exists $ updateIndex menv index
 
 -- | Update all of the package indices
 updateAllIndices
     :: (MonadIO m,MonadLogger m
-       ,MonadThrow m,MonadReader env m,HasHttpManager env
+       ,MonadReader env m,HasHttpManager env
        ,HasConfig env,MonadBaseControl IO m, MonadCatch m)
     => EnvOverride
     -> m ()
@@ -200,7 +198,7 @@ updateAllIndices menv =
 
 -- | Update the index tarball
 updateIndex :: (MonadIO m,MonadLogger m
-               ,MonadThrow m,MonadReader env m,HasHttpManager env
+               ,MonadReader env m,HasHttpManager env
                ,HasConfig env,MonadBaseControl IO m, MonadCatch m)
             => EnvOverride
             -> PackageIndex
@@ -217,7 +215,7 @@ updateIndex menv index =
         (False, ILGit url) -> logUpdate url >> throwM (GitNotAvailable name)
 
 -- | Update the index Git repo and the index tarball
-updateIndexGit :: (MonadIO m,MonadLogger m,MonadThrow m,MonadReader env m,HasConfig env,MonadBaseControl IO m, MonadCatch m)
+updateIndexGit :: (MonadIO m,MonadLogger m,MonadReader env m,HasConfig env,MonadBaseControl IO m, MonadCatch m)
                => EnvOverride
                -> IndexName
                -> PackageIndex
@@ -226,7 +224,7 @@ updateIndexGit :: (MonadIO m,MonadLogger m,MonadThrow m,MonadReader env m,HasCon
 updateIndexGit menv indexName' index gitUrl = do
      tarFile <- configPackageIndex indexName'
      let idxPath = parent tarFile
-     createTree idxPath
+     ensureDir idxPath
      do
             repoName <- parseRelDir $ takeBaseName $ T.unpack gitUrl
             let cloneArgs =
@@ -242,13 +240,20 @@ updateIndexGit menv indexName' index gitUrl = do
                   sDir </>
                   $(mkRelDir "git-update")
                 acfDir = suDir </> repoName
-            repoExists <- dirExists acfDir
+            repoExists <- doesDirExist acfDir
             unless repoExists
                    (readInNull suDir "git" menv cloneArgs Nothing)
             $logSticky "Fetching package index ..."
-            readInNull acfDir "git" menv ["fetch","--tags","--depth=1"] Nothing
+            readProcessNull (Just acfDir) menv "git" ["fetch","--tags","--depth=1"] `C.catch` \(ex :: ReadProcessException) -> do
+              -- we failed, so wipe the directory and try again, see #1418
+              $logWarn (T.pack (show ex))
+              $logStickyDone "Failed to fetch package index, retrying."
+              removeDirRecur acfDir
+              readInNull suDir "git" menv cloneArgs Nothing
+              $logSticky "Fetching package index ..."
+              readInNull acfDir "git" menv ["fetch","--tags","--depth=1"] Nothing
             $logStickyDone "Fetched package index."
-            removeFileIfExists tarFile
+            ignoringAbsence (removeFile tarFile)
             when (indexGpgVerify index)
                  (readInNull acfDir
                              "git"
@@ -291,7 +296,7 @@ updateIndexHTTP indexName' index url = do
     toUnpack <-
         if wasDownloaded
             then return True
-            else liftM not $ fileExists tar
+            else not `liftM` doesFileExist tar
 
     when toUnpack $ do
         let tmp = toFilePath tar <.> "tmp"

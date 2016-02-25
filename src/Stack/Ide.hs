@@ -8,7 +8,7 @@
 -- | Run a IDE configured with the user's package(s).
 
 module Stack.Ide
-    (ide, getPackageOptsAndTargetFiles)
+    (ide, getPackageOptsAndTargetFiles, ideGhciOpts)
     where
 
 import           Control.Monad.Catch
@@ -27,7 +27,7 @@ import           Path
 import           Path.Extra (toFilePathNoTrailingSep)
 import           Path.IO
 import           Stack.Constants
-import           Stack.Ghci (GhciPkgInfo(..), ghciSetup)
+import           Stack.Ghci (GhciPkgInfo(..), GhciOpts(..), ghciSetup)
 import           Stack.Package
 import           Stack.Types
 import           Stack.Types.Internal
@@ -44,12 +44,12 @@ ide
     -> [String] -- ^ GHC options.
     -> m ()
 ide targets useropts = do
-    let bopts = defaultBuildOpts
-            { boptsTargets = targets
-            , boptsBuildSubset = BSOnlyDependencies
+    let boptsCli = defaultBuildOptsCLI
+            { boptsCLITargets = targets
+            , boptsCLIBuildSubset = BSOnlyDependencies
             }
-    (_realTargets,_,pkgs) <- ghciSetup bopts False Nothing
-    pwd <- getWorkingDir
+    (_realTargets,_,pkgs) <- ghciSetup (ideGhciOpts boptsCli)
+    pwd <- getCurrentDir
     (pkgopts,_srcfiles) <-
         liftM mconcat $ forM pkgs $ getPackageOptsAndTargetFiles pwd
     localdb <- packageDatabaseLocal
@@ -73,9 +73,9 @@ ide targets useropts = do
     Platform _ os <- asks getPlatform
     when
         (os == OSX)
-        (catch (callProcess (Just pwd) menv "stty" ["cbreak", "-imaxbel"])
+        (catch (callProcess (Cmd (Just pwd) "stty" menv ["cbreak", "-imaxbel"]))
                (\(_ :: ProcessExitedUnsuccessfully) -> return ()))
-    callProcess (Just pwd) menv "stack-ide" args
+    callProcess (Cmd (Just pwd) "stack-ide" menv args)
   where
     includeDirs pkgopts =
         intercalate
@@ -96,11 +96,30 @@ getPackageOptsAndTargetFiles pwd pkg = do
             (autogen </>)
             (parseRelFile
                  ("Paths_" ++ packageNameString (ghciPkgName pkg) ++ ".hs"))
-    paths_foo_exists <- fileExists paths_foo
+    paths_foo_exists <- doesFileExist paths_foo
+    let ghcOptions bio =
+            bioOneWordOpts bio ++
+            bioOpts bio ++
+            bioPackageFlags bio ++
+            maybe [] (\cabalMacros -> ["-optP-include", "-optP" <> toFilePath cabalMacros]) (bioCabalMacros bio)
     return
         ( ("--dist-dir=" <> toFilePathNoTrailingSep dist) :
-          map ("--ghc-option=" ++) (concatMap (\(_, bio) -> bioGeneratedOpts bio ++ bioGhcOpts bio) (ghciPkgOpts pkg))
+          map ("--ghc-option=" ++) (concatMap (ghcOptions . snd) (ghciPkgOpts pkg))
         , mapMaybe
               (fmap toFilePath . stripDir pwd)
               (S.toList (ghciPkgCFiles pkg) <> S.toList (ghciPkgModFiles pkg) <>
                [paths_foo | paths_foo_exists]))
+
+ideGhciOpts :: BuildOptsCLI -> GhciOpts
+ideGhciOpts boptsCli = GhciOpts
+    { ghciNoBuild = False
+    , ghciArgs = []
+    , ghciGhcCommand = Nothing
+    , ghciNoLoadModules = False
+    , ghciAdditionalPackages = []
+    , ghciMainIs = Nothing
+    , ghciLoadLocalDeps = False
+    , ghciSkipIntermediate = False
+    , ghciHidePackages = True
+    , ghciBuildOptsCLI = boptsCli
+    }

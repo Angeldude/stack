@@ -1,3 +1,5 @@
+# YAML Configuration
+
 This page is intended to fully document all configuration options available in the stack.yaml file. Note that this page is likely to be both *incomplete* and sometimes *inaccurate*. If you see such cases, please update the page, and if you're not sure how, open an issue labeled "question".
 
 The stack.yaml configuration options break down into [project specific](#project-config) options in:
@@ -27,18 +29,28 @@ packages:
 - dir3
 ```
 
-However, it supports two other location types: an HTTP URL referring to a tarball that can be downloaded, and information on a Git repo to clone, together with this SHA1 commit. For example:
+When the `packages` field is not present, it defaults to looking for a package in the project's root directory:
+
+```yaml
+packages:
+  - .
+```
+
+However, it supports three other location types: an HTTP URL referring to a tarball or a zip that can be downloaded, and information on a Git or Mercurial (since 0.1.10.0) repo to clone, together with this SHA1 commit. For example:
 
 ```yaml
 packages:
 - some-directory
 - https://example.com/foo/bar/baz-0.0.2.tar.gz
 - location:
-    git: git@github.com:commercialhaskell/stack
+    git: git@github.com:commercialhaskell/stack.git
     commit: 6a86ee32e5b869a877151f74064572225e1a0398
+- location:
+    hg: https://example.com/hg/repo
+    commit: da39a3ee5e6b4b0d3255bfef95601890afd80709
 ```
 
-Note: it is highly recommended that you only use SHA1 values for a Git commit. Other values may work, but they are not officially supported, and may result in unexpected behavior (namely, stack will not automatically pull to update to new versions).
+Note: it is highly recommended that you only use SHA1 values for a Git or Mercurial commit. Other values may work, but they are not officially supported, and may result in unexpected behavior (namely, stack will not automatically pull to update to new versions).
 
 stack further allows you to tweak your packages by specifying two additional
 settings:
@@ -63,11 +75,21 @@ packages:
   - wai
 ```
 
+Instead of using Git to clone from Github, it is also possible to use the 'Download commit as Zip' feature of the website. For example:
+
+```yaml
+packages:
+- location: http://github.com/yesodweb/wai/archive/2f8a8e1b771829f4a8a77c0111352ce45a14c30f.zip
+  subdirs:
+  - auto-update
+  - wai
+```
+
 ### extra-deps
 
 This is a list of package identifiers for additional packages from upstream to
 be included. This is usually used to augment an LTS Haskell or Stackage Nightly
-snapshot with a package that is not present or is at an older version than you
+snapshot with a package that is not present or is at an different version than you
 wish to use.
 
 ```yaml
@@ -102,15 +124,46 @@ Flags will only affect packages in your `packages` and `extra-deps` settings.
 Packages that come from the snapshot global database or are not affected.
 
 ### image
-The image settings are used for the creation of container images using `stack image container`, e.g.
+
+The image settings are used for the creation of container images using `stack
+image container`, e.g.
+
 ```yaml
 image:
-  container:
-    base: "fpco/stack-build"
-    add:
-      static: /data/static
+  containers:
+    - base: "fpco/stack-build"
+      add:
+        static: /data/static
 ```
-`base` is the docker image that will be used to built upon. The `add` lines allow you to add additional directories to your image. You can also specify `entrypoints`. Your executables are placed in `/usr/local/bin`.
+
+`base` is the docker image that will be used to built upon. The `add` lines
+allow you to add additional directories to your image. You can specify the name
+of the image using `name` (otherwise it defaults to the same as your project).
+You can also specify `entrypoints`. By default all your executables are placed
+in `/usr/local/bin`, but you can specify a list using `executables` to only add
+some.
+
+### user-message
+
+A user-message is inserted by `stack init` when it omits packages or adds
+external dependencies. For example:
+
+```yaml
+user-message: ! 'Warning: Some packages were found to be incompatible with the resolver
+  and have been left commented out in the packages section.
+
+  Warning: Specified resolver could not satisfy all dependencies. Some external packages
+  have been added as dependencies.
+
+  You can suppress this message by removing it from stack.yaml
+
+'
+```
+
+This messages is displayed every time the config is loaded by stack and serves
+as a reminder for the user to review the configuration and make any changes if
+needed. The user can delete this message if the generated configuration is
+acceptable.
 
 ## Non-project config
 
@@ -118,7 +171,13 @@ Non-project config options may go in the global config (`/etc/stack/config.yaml`
 
 ### docker
 
-See [Docker configuration](https://github.com/commercialhaskell/stack/blob/release/doc/docker_integration.md).
+See [Docker integration](docker_integration.md#configuration).
+
+### nix
+
+(since 0.1.10.0)
+
+See [Nix integration](nix_integration.md#configuration).
 
 ### connection-count
 
@@ -376,6 +435,22 @@ allow-newer: true
 Note that this also ignores lower bounds. The name "allow-newer" is chosen to
 match the commonly used cabal option.
 
+### allow-different-user
+
+(Since 1.0.1)
+
+Allow users other than the owner of the stack root directory (typically `~/.stack`)
+to use the stack installation. The default is `false`. POSIX systems only.
+
+```yaml
+allow-different-user: true
+```
+
+The intention of this option is to prevent file permission problems, for example
+as the result of a `stack` command executed under `sudo`.
+
+The option is automatically enabled when `stack` is re-spawned in a Docker process.
+
 ### templates
 
 Templates used with `stack new` have a number of parameters that affect the generated code. These can be set for all new projects you create. The result of them can be observed in the generated LICENSE and cabal files.
@@ -402,6 +477,6 @@ templates:
     author-name: Your Name
     author-email: youremail@example.com
     category: Your Projects Category
-    copyright: Copyright: (c) 2015 Your Name
+    copyright: 'Copyright: (c) 2016 Your Name'
     github-username: yourusername
 ```

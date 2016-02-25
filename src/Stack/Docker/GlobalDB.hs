@@ -16,10 +16,11 @@ module Stack.Docker.GlobalDB
   where
 
 import           Control.Exception (IOException,catch,throwIO)
-import           Control.Monad (forM_)
+import           Control.Monad (forM_, when)
 import           Control.Monad.Logger (NoLoggingT)
 import           Control.Monad.Trans.Resource (ResourceT)
 import           Data.List (sortBy, isInfixOf, stripPrefix)
+import           Data.List.Extra (stripSuffix)
 import qualified Data.Map.Strict as Map
 import           Data.Maybe (fromMaybe)
 import qualified Data.Text as T
@@ -28,7 +29,7 @@ import           Database.Persist
 import           Database.Persist.Sqlite
 import           Database.Persist.TH
 import           Path (toFilePath, parent)
-import           Path.IO (createTree)
+import           Path.IO (ensureDir)
 import           Stack.Types.Config
 import           Stack.Types.Docker
 
@@ -75,11 +76,11 @@ getDockerImagesLastUsed config =
 pruneDockerImagesLastUsed :: Config -> [String] -> IO ()
 pruneDockerImagesLastUsed config existingHashes =
   withGlobalDB config go
-  where go = do l <- selectList [] []
-                forM_ l (\(Entity k (DockerImageProject{dockerImageProjectImageHash = h})) ->
-                           if h `elem` existingHashes
-                             then return ()
-                             else delete k)
+  where
+    go = do
+        l <- selectList [] []
+        forM_ l (\(Entity k DockerImageProject{dockerImageProjectImageHash = h}) ->
+            when (h `notElem` existingHashes) $ delete k)
 
 -- | Get the record of whether an executable is compatible with a Docker image
 getDockerImageExe :: Config -> String -> FilePath -> UTCTime -> IO (Maybe Bool)
@@ -99,13 +100,12 @@ setDockerImageExe config imageId exePath exeTimestamp compatible =
 withGlobalDB :: forall a. Config -> SqlPersistT (NoLoggingT (ResourceT IO)) a -> IO a
 withGlobalDB config action =
   do let db = dockerDatabasePath (configDocker config)
-     createTree (parent db)
+     ensureDir (parent db)
      runSqlite (T.pack (toFilePath db))
                (do _ <- runMigrationSilent migrateTables
                    action)
          `catch` \ex -> do
              let str = show ex
-                 stripSuffix x = fmap reverse . stripPrefix x . reverse
                  str' = fromMaybe str $ stripPrefix "user error (" $
                         fromMaybe str $ stripSuffix ")" str
              if "ErrorReadOnly" `isInfixOf` str
